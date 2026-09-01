@@ -15,10 +15,14 @@ import (
 
 // forbiddenFieldSubstrings catches any field that would let a caller see or
 // carry Postal's own credentials. Design 001 §9.2: Postal's per-message
-// token is deliberately never exposed — it is only useful with a Postal API
-// key, which callers never hold.
+// *token* is deliberately never exposed — it is only useful with a Postal
+// API key, which callers never hold. "token" is included bare (not just
+// "postal_token") because that is the design doc's own name for the
+// credential, and Postal's API returns it as a plain "token" field — a
+// future field named e.g. "token" or "postal_message_token" (mirroring the
+// sibling field "postal_message_id") must be caught too.
 var forbiddenFieldSubstrings = []string{
-	"postal_token",
+	"token",
 	"postal_api_key",
 	"postal_apikey",
 	"api_key",
@@ -62,12 +66,11 @@ func TestNoPostalCredentialFields(t *testing.T) {
 		}
 	}
 
-	var sawFile bool
+	var sawEmailPackage bool
 	protoregistry.GlobalFiles.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
-		if !strings.HasPrefix(string(fd.Package()), "email.v1") && !strings.HasPrefix(string(fd.Package()), "hello.v1") {
-			return true
+		if fd.Package() == "email.v1" {
+			sawEmailPackage = true
 		}
-		sawFile = true
 		msgs := fd.Messages()
 		for i := 0; i < msgs.Len(); i++ {
 			walk(msgs.Get(i))
@@ -75,8 +78,8 @@ func TestNoPostalCredentialFields(t *testing.T) {
 		return true
 	})
 
-	if !sawFile {
-		t.Fatal("no email.v1/hello.v1 file descriptors registered — is the generated package imported?")
+	if !sawEmailPackage {
+		t.Fatal("no email.v1 file descriptors registered — is the generated package imported?")
 	}
 	if checked == 0 {
 		t.Fatal("walked zero fields — the descriptor walk is not visiting any message")

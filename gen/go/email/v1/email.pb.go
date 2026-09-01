@@ -32,7 +32,7 @@ const (
 	DeliveryStatus_DELIVERY_STATUS_SENT DeliveryStatus = 2
 	// Temporary failure, Postal retrying.
 	DeliveryStatus_DELIVERY_STATUS_SOFT_FAIL DeliveryStatus = 3
-	// Permanent failure -- the caller's suppression signal (design 001 §11.4).
+	// Permanent failure — the caller's suppression signal (design 001 §11.4).
 	DeliveryStatus_DELIVERY_STATUS_HARD_FAIL DeliveryStatus = 4
 	// Held by Postal (e.g. domain not verified).
 	DeliveryStatus_DELIVERY_STATUS_HELD DeliveryStatus = 5

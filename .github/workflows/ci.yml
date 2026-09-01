@@ -7,6 +7,9 @@
 #   3. proto-gen      — regenerate the SDK
 #   4. gen-in-sync    — committed gen/ matches proto/ exactly
 #   5. go build       — the generated SDK actually compiles
+#   6. go test        — contract-level invariants (e.g. contractcheck/: no
+#                        vendor credential field, like a Postal token/API key,
+#                        is ever exposed on the descriptor set)
 #
 # Every step runs a devtools target inside the devtools container, identical
 # to `just <target>` locally. No credentials: this repo is public, its own
