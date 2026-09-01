@@ -28,10 +28,10 @@ GitHub plays the schema-registry role:
 | Package | Contents | Go import path |
 |---|---|---|
 | `hello.v1` | `SayHello` — a v0 smoke test proving the contract pipeline (buf lint → buf breaking → proto-gen → committed SDK → build) end to end before the first real sphyrix-hosted-service package lands. | `gen/go/hello/v1` |
+| `email.v1` | `EmailService` (`SendEmail`, `GetMessage`) — the `email-service` API (design 001 §9.2). Postal's per-message token is deliberately not exposed. | `gen/go/email/v1` |
 
-`email.v1` (the `email-service` API, design 001 §9.2, ADR 027) and `go/auth` (the shared M2M
-bearer middleware, ADR 027) land in follow-on stories (Epic 9, Stories 9.2–9.4) on top of this
-scaffold.
+`go/auth` (the shared M2M bearer middleware, ADR 027) lands in a follow-on story (Epic 9, Story
+9.3) on top of this scaffold.
 
 ## Consuming (Go)
 
@@ -45,6 +45,9 @@ go get github.com/sphyrix/contracts@latest
 import (
     hellov1 "github.com/sphyrix/contracts/gen/go/hello/v1"
     "github.com/sphyrix/contracts/gen/go/hello/v1/hellov1connect"
+
+    emailv1 "github.com/sphyrix/contracts/gen/go/email/v1"
+    "github.com/sphyrix/contracts/gen/go/email/v1/emailv1connect"
 )
 ```
 
@@ -75,8 +78,12 @@ Rules:
 
 ```
 proto/hello/v1/hello.proto        # schema source of truth
+proto/email/v1/email.proto        # schema source of truth
 gen/go/hello/v1/                  # generated: protobuf types
 gen/go/hello/v1/hellov1connect/   # generated: connect-go handlers/clients
+gen/go/email/v1/                  # generated: protobuf types
+gen/go/email/v1/emailv1connect/   # generated: connect-go handlers/clients
+contractcheck/                    # cross-package descriptor assertions (e.g. no Postal secrets)
 docs/                             # design docs (000-, 001-, ...)
 ```
 
@@ -91,7 +98,7 @@ This repo is a structural mirror of `huntful-contracts` (design 001 §10). Recor
 |---|---|---|
 | Visibility | private (`GO_MODULES_TOKEN`/`GOPRIVATE` required) | **public** — no credentials required |
 | Module | `github.com/BecomingTheHunter/huntful-contracts` | `github.com/sphyrix/contracts` |
-| Packages | `hello.v1`, `iam.v1`, `user.v1`, … (10 domain packages) | `hello.v1` only (this story); `email.v1` and further `<domain>.v1` packages land per sphyrix-hosted service in follow-on stories |
+| Packages | `hello.v1`, `iam.v1`, `user.v1`, … (10 domain packages) | `hello.v1`, `email.v1` (Story 9.2); further `<domain>.v1` packages land per sphyrix-hosted service in follow-on stories |
 | Extra | — | `go/auth` — the M2M bearer middleware (ADR 027), lands in Story 9.3 |
 
 Implementation-detail differences not called out in §10's table, justified here:

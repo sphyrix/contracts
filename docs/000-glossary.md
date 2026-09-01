@@ -4,9 +4,10 @@
 > Design docs link here on a term's first use instead of redefining it. Terms are alphabetical;
 > add new ones in place.
 
-No domain terms are defined here yet — this repo currently ships only the `hello.v1` pipeline
-smoke test (Story 9.1). Domain terms (`email.v1`, the M2M token convention, …) are added as the
-packages that introduce them land — see [`docs/001-sphyrix-contracts.md`](001-sphyrix-contracts.md).
+No domain terms are defined here yet. `email.v1` (Story 9.2) introduces no repo-specific
+terminology beyond what design 001 §9.2 and §2 already define — see
+[`docs/001-sphyrix-contracts.md`](001-sphyrix-contracts.md). Terms specific to a future package
+(the M2M token convention's `go/auth`, …) are added as those packages land.
 
 Platform-wide terms (org, tenant, addon, the M2M token convention, …) are defined in the
 `sphyrix/infrastructure` repo's own glossary and design docs; this glossary only holds terms

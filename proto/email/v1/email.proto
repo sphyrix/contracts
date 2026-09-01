@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package email.v1;
+
+option go_package = "github.com/sphyrix/contracts/gen/go/email/v1;emailv1";
+
+import "google/protobuf/timestamp.proto";
+
+// EmailService is the sphyrix-hosted email-service API (design 001 §9.2).
+// Every RPC requires an `authorization: Bearer <token>` M2M token (ADR 027);
+// GetMessage only returns messages previously sent by the calling org.
+service EmailService {
+  // SendEmail sends one message. Idempotent on (org, idempotency_key) for 24h.
+  rpc SendEmail(SendEmailRequest) returns (SendEmailResponse);
+  // GetMessage reads back delivery status for a message previously sent by
+  // this org.
+  rpc GetMessage(GetMessageRequest) returns (GetMessageResponse);
+}
+
+message Address {
+  string email = 1;
+  string name = 2;
+}
+
+message Attachment {
+  string filename = 1;
+  // MIME type; defaults to application/octet-stream.
+  string content_type = 2;
+  // Raw bytes; total message size is capped (design 001 §6.2 limits).
+  bytes data = 3;
+}
+
+message SendEmailRequest {
+  // local_part of a declared [[email.senders]]; "" = no-reply.
+  string sender = 1;
+  // Optional override of the sender's display_name.
+  string display_name = 2;
+  // Optional override of the sender's reply_to.
+  string reply_to = 3;
+  // At least one recipient is required.
+  repeated Address to = 4;
+  repeated Address cc = 5;
+  repeated Address bcc = 6;
+  // Required, <= 998 bytes, no CR/LF.
+  string subject = 7;
+  // At least one of text_body / html_body is required.
+  string text_body = 8;
+  string html_body = 9;
+  repeated Attachment attachments = 10;
+  // Extra headers; From/To/Cc/Bcc/Date/Message-ID/DKIM-* are rejected.
+  map<string, string> headers = 11;
+  // Free-form, <= 64 chars, passed to Postal's `tag`.
+  string tag = 12;
+  // At most 16 entries; stored on the audit row and echoed by GetMessage.
+  map<string, string> metadata = 13;
+  // Optional, <= 128 chars; scoped to the org.
+  string idempotency_key = 14;
+}
+
+message SendEmailResponse {
+  // email-service id (uuidv7); stable across idempotent retries.
+  string message_id = 1;
+  repeated RecipientResult recipients = 2;
+  // True when idempotency_key matched an earlier accepted send.
+  bool deduplicated = 3;
+}
+
+message RecipientResult {
+  string email = 1;
+  string postal_message_id = 2;
+}
+
+message GetMessageRequest {
+  string message_id = 1;
+}
+
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  // Accepted, not yet attempted.
+  DELIVERY_STATUS_PENDING = 1;
+  // Postal reports "Sent".
+  DELIVERY_STATUS_SENT = 2;
+  // Temporary failure, Postal retrying.
+  DELIVERY_STATUS_SOFT_FAIL = 3;
+  // Permanent failure -- the caller's suppression signal (design 001 §11.4).
+  DELIVERY_STATUS_HARD_FAIL = 4;
+  // Held by Postal (e.g. domain not verified).
+  DELIVERY_STATUS_HELD = 5;
+}
+
+message GetMessageResponse {
+  string message_id = 1;
+  google.protobuf.Timestamp accepted_at = 2;
+  string sender = 3;
+  string subject = 4;
+  string tag = 5;
+  map<string, string> metadata = 6;
+  repeated RecipientStatus recipients = 7;
+}
+
+message RecipientStatus {
+  string email = 1;
+  DeliveryStatus status = 2;
+  // Postal's last delivery detail, if any.
+  string details = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}
