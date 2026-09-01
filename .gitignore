@@ -1,0 +1,8 @@
+# Local env for devtools recipes (Justfile has `set dotenv-load`) — never commit.
+.env
+
+# NOTE: .devtools-proxy.just IS committed (unlike the devtools default) — CI
+# runs inside the devtools container where `_ensure` is a no-op, so the proxy
+# recipes must already be present in the checkout for `just <target>` to work.
+.orchestrator/
+.worktrees/

@@ -1,0 +1,64 @@
+# CI — the contract gate. This repo IS the schema registry (source of truth
+# in proto/, versions via git tags, generated Go SDK committed under gen/go),
+# so CI's job is to keep those three honest:
+#
+#   1. buf lint       — style/structure of the schemas
+#   2. buf breaking   — no breaking change ever lands on main
+#   3. proto-gen      — regenerate the SDK
+#   4. gen-in-sync    — committed gen/ matches proto/ exactly
+#   5. go build       — the generated SDK actually compiles
+#
+# Every step runs a devtools target inside the devtools container, identical
+# to `just <target>` locally. No credentials: this repo is public, its own
+# deps are public modules, and nothing here touches a cluster or registry.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/sphyrix/devtools:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # proto-breaking diffs against .git#branch=main — needs full history.
+          fetch-depth: 0
+
+      # PR checkouts have origin/main but no local `main` ref; buf breaking clones
+      # the local .git at branch=main, so materialise it.
+      - name: Ensure local main ref
+        run: git fetch --no-tags origin main:main || true
+
+      - name: buf lint
+        run: just proto-lint
+
+      - name: buf breaking (vs main)
+        run: just proto-breaking
+
+      - name: Regenerate SDK
+        run: just proto-gen
+
+      - name: Generated code in sync
+        run: |
+          git diff --exit-code -- gen/ || {
+            echo "::error::gen/ is out of sync with proto/ — run 'just proto-gen' and commit the result"
+            exit 1
+          }
+
+      - name: go build
+        run: just build

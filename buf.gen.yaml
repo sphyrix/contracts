@@ -1,0 +1,16 @@
+# Code generation config. Generated code under gen/ is COMMITTED and IS the
+# artifact this repo serves: consumers `go get` this module — GitHub plays the
+# schema-registry role (source of truth in proto/, versions via git tags,
+# generated SDK via Go modules). CI fails if gen/ is out of sync with proto/.
+#
+# Regenerate with `just proto-gen` after editing proto/. Plugins run via
+# `go run` so nothing needs to be installed (works as-is inside the devtools
+# container); both resolve to the module versions pinned in go.mod.
+version: v2
+plugins:
+  - local: ["go", "run", "google.golang.org/protobuf/cmd/protoc-gen-go"]
+    out: gen/go
+    opt: paths=source_relative
+  - local: ["go", "run", "connectrpc.com/connect/cmd/protoc-gen-connect-go"]
+    out: gen/go
+    opt: paths=source_relative

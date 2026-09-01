@@ -1,0 +1,17 @@
+# .project.toml — devtools configuration.
+#
+# This repo is the DOMAIN CONTRACT, not a service: no [k8s] section (the
+# onboarding reconciler ignores repos without one), no docker addon. It holds
+# the proto sources plus the committed generated Go SDK that every
+# sphyrix-hosted service and every caller imports.
+
+[project]
+name   = "contracts"
+org    = "sphyrix"
+lang   = ["golang"]              # build target proves the generated SDK compiles
+addons = ["proto"]               # proto-gen / proto-lint / proto-breaking (buf)
+
+[devtools]
+# The PUBLIC ghcr mirror — same image CI pulls anonymously, so local and CI
+# toolchains stay identical.
+image = "ghcr.io/sphyrix/devtools:latest"
