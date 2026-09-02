@@ -887,6 +887,21 @@ func TestCASWriterGivesUpLoudlyAfterABoundedNumberOfAttempts(t *testing.T) {
 	}
 }
 
+// The exhaustion error wraps BOTH sentinels, so a caller can ask "did the
+// budget run out?" and "why?" without parsing the message.
+func TestCASExhaustionWrapsTheRefusalToo(t *testing.T) {
+	source := &versionSource{versions: []int{1}}
+	refusal := fmt.Errorf("vault: check-and-set parameter did not match: %w", ErrCASRefused)
+	err := CASWriter{Version: source, Attempts: 2}.Write(context.Background(), "org",
+		func(context.Context, int) error { return refusal })
+	if !errors.Is(err, ErrCASExhausted) {
+		t.Errorf("the error does not match ErrCASExhausted: %v", err)
+	}
+	if !errors.Is(err, ErrCASRefused) {
+		t.Errorf("the error does not match ErrCASRefused: %v — a caller cannot tell WHY the budget ran out", err)
+	}
+}
+
 // Zero and negative Attempts mean the default, never "unbounded".
 func TestCASWriterAttemptsCannotBeUnbounded(t *testing.T) {
 	for name, attempts := range map[string]int{"zero": 0, "negative": -5} {

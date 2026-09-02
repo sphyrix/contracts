@@ -110,6 +110,12 @@
 // [Identity.TokenVersion] and [Identity.AppliedTokenVersion], because without
 // the applied version there is no set to check against.
 //
+// This package therefore spans two things: the bearer middleware a caller uses
+// on every request, and the ruled token LIFECYCLE a verifying service runs on a
+// bump. It still holds no Vault client and must never acquire one — the
+// lifecycle half is expressed as interfaces and a retry loop, and the Vault
+// call itself belongs to the service.
+//
 // Writing the new token is a check-and-set: #488 arms the KV v2 mount, so a
 // mint reads the current version from `kv/metadata/+/platform/<service>/*`
 // (the version, never the value — the ADR 027 Decision 4 amendment of

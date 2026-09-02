@@ -488,6 +488,14 @@ type TokenPathVersion interface {
 	// path, to be sent as `cas` on the next write. Zero means the secret does
 	// not exist yet, which is what a first mint sends.
 	//
+	// Zero is the one answer that can mislead. ADR 024 Decision 3 records the
+	// trap: a SOFT-DELETED latest version makes `cas=0` fail while a read
+	// returns nothing, so "nothing there" and "nothing there yet" are not the
+	// same state. It is reachable — a tenant can soft-delete its own token
+	// through `<tenant>-tenant-rw` (ADR 027 Decision 5) — and recovery is an
+	// operator `kv/metadata` destroy, not something a mint can do for itself.
+	// Report the resulting refusal rather than trying to write around it.
+	//
 	// An error must fail the mint. Do NOT fall back to a guess: a wrong `cas`
 	// is refused by Vault, which is the safe direction — nothing is written,
 	// no hash row is stored, and the next resync retries, exactly as ADR 027
@@ -544,6 +552,12 @@ type CASWriter struct {
 // obligations in this package's documentation apply inside that closure like
 // everywhere else.
 //
+// THE SAME TOKEN IS REWRITTEN ON EVERY ATTEMPT. Never re-mint per attempt: a
+// fresh secret each time round would burn a KV version per retry and, worse,
+// could end with a stored hash for a token nobody ever received — exactly the
+// hazard ADR 027 Decision 3's Vault-first, hash-second ordering exists to
+// prevent. Mint once, then let this loop place that one token.
+//
 // Errors: the version source's error (the mint fails; nothing is written), the
 // write's own non-cas error unchanged, or [ErrCASExhausted]. On success the
 // caller stores the hash SECOND, per ADR 027 Decision 3.
@@ -584,6 +598,9 @@ func (w CASWriter) Write(ctx context.Context, org string, write func(ctx context
 		}
 	}
 
-	return fmt.Errorf("auth: %d attempts to write the token for %q were all refused (last: %v): %w",
-		attempts, org, refused, ErrCASExhausted)
+	// Both sentinels are wrapped: a caller that wants to know the budget ran
+	// out matches ErrCASExhausted, one that wants to know why matches
+	// ErrCASRefused, and neither has to parse the message.
+	return fmt.Errorf("auth: %d attempts to write the token for %q were all refused: %w (%w)",
+		attempts, org, ErrCASExhausted, refused)
 }
