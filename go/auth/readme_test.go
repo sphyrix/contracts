@@ -148,7 +148,7 @@ func revocationSection(t *testing.T, readme, heading string) string {
 	rest := readme[start+len(heading):]
 
 	end := len(rest)
-	for _, line := range []string{"\n# ", "\n## ", "\n### ", "\n#### ", "\n##### "} {
+	for _, line := range []string{"\n# ", "\n## ", "\n### ", "\n#### ", "\n##### ", "\n###### "} {
 		if at := strings.Index(rest, line); at >= 0 && at < end {
 			end = at
 		}

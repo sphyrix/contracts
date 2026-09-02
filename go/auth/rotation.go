@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -233,7 +234,11 @@ type RotationState struct {
 //
 // ADR 020's Consequences call for "a minimum interval, OR a check that the new
 // version is in use". The interval is always enforced; this chooses whether
-// the second check is enforced alongside it. The zero value is the strict one.
+// the second check is enforced alongside it.
+//
+// [EvidenceOptional] is the ONLY value that waives anything. The zero value is
+// strict, and so is every other value: a policy this package does not
+// recognise must never come out lax.
 type EvidencePolicy int
 
 const (
@@ -253,10 +258,20 @@ const (
 	// forever when the consumer is offboarded (the very case a revocation is
 	// usually for), has not gone live yet, or sends monthly.
 	//
-	// Use it when the service does not track last use at all, or when the
-	// operator holds evidence this package cannot see — ADR 019's delivery run
-	// record is the inventory of which off-platform consumer holds which
-	// version, and it lives outside any database this guard can read.
+	// WHO SETS IT, in v1: the verifying SERVICE, once, from whether it records
+	// [RotationState.AppliedLastUsedAt] at all. It is not a per-incident knob —
+	// an operator working through the revocation procedure cannot set a Go
+	// struct field, and there is no control surface that would let them. A
+	// per-org or per-incident waiver is a successor decision, and it needs
+	// somewhere to be expressed before it can exist.
+	//
+	// So a service that does not track last use MUST set this, or the only
+	// revocation path it has is unreachable in production — which is the same
+	// hole as never having offered the waiver.
+	//
+	// The out-of-band evidence an operator actually holds is ADR 019's delivery
+	// run record: the inventory of which off-platform consumer holds which
+	// version, living outside any database this guard can read.
 	//
 	// It does NOT relax the interval. There is still no way to spell "no
 	// interval".
@@ -395,7 +410,13 @@ func (g BumpGuard) CheckBump(state RotationState, declared int32) error {
 			state.Applied, elapsed.Round(time.Second), minInterval, declared, formatVersions(retired), state.Applied, ErrBumpTooSoon)
 	}
 
-	if g.Evidence == EvidenceRequired &&
+	// Compared against the OPT-OUT, not against the strict value: EvidencePolicy
+	// is an exported named int with exported-field access, so an unmarshalled
+	// config value, a cast, or a third constant added out of order can all
+	// produce something that is neither constant. `== EvidenceRequired` would
+	// have waived the check for every one of them — half of the only
+	// revocation guardrail, silently disabled, in the lax direction.
+	if g.Evidence != EvidenceOptional &&
 		(state.AppliedLastUsedAt.IsZero() || state.AppliedLastUsedAt.Before(state.AppliedAt)) {
 		return fmt.Errorf("auth: no request has authenticated with token_version %d since it was applied, so nothing shows a consumer has cut over to it and bumping to %d would retire %s: %w",
 			state.Applied, declared, formatVersions(retired), ErrVersionNotInUse)
@@ -433,4 +454,43 @@ func formatVersions(versions []int32) string {
 		rendered[i] = strconv.Itoa(int(version))
 	}
 	return "token_versions " + strings.Join(rendered[:len(rendered)-1], ", ") + " and " + rendered[len(rendered)-1]
+}
+
+// TokenPathVersion supplies the check-and-set version that a mint must present
+// when it writes an org's token to Vault.
+//
+// It exists because #488 arms the KV v2 mount with `cas_required=true`, and
+// ADR 020's mint-beside is an OVERWRITE of
+// `kv/data/<org>/platform/<service>/token`. A KV v2 write on an armed mount
+// must carry `cas` equal to the secret's current version, and ADR 027 Decision
+// 4 gives the verifying service `create`/`update` on
+// `kv/data/+/platform/<service>/*` with — verbatim — "no `read`, `delete` or
+// `kv/metadata` grant". The writer therefore cannot learn the number it is
+// required to send. Where that number comes from is an open ruling, so it is a
+// PLUGGABLE INPUT here rather than a decision this package makes:
+//
+//   - a metadata read (`kv/metadata/+/platform/<service>/*`, version but never
+//     value) — an amendment to Decision 4's grant list, and it has to be
+//     recorded on ADR 027 as one;
+//   - the service tracking the version itself from its own hash rows;
+//   - one KV path per token version, where every write is a create and the
+//     answer is always 0.
+//
+// One method covers all three, which is the point: the ruling becomes a choice
+// of implementation and neither this contract nor Story 11.3 (#434) is
+// redesigned around it.
+//
+// This package has no Vault client and must never acquire one — the interface
+// is deliberately expressed in ctx, an org and an int.
+type TokenPathVersion interface {
+	// CurrentVersion returns the KV v2 version currently stored at org's token
+	// path, to be sent as `cas` on the next write. Zero means the secret does
+	// not exist yet, which is what a first mint sends.
+	//
+	// An error must fail the mint. Do NOT fall back to a guess: a wrong `cas`
+	// is refused by Vault, which is the safe direction — nothing is written,
+	// no hash row is stored, and the next resync retries, exactly as ADR 027
+	// Decision 3's Vault-first ordering already provides for. Sending no `cas`
+	// at all is refused outright by an armed mount.
+	CurrentVersion(ctx context.Context, org string) (int, error)
 }

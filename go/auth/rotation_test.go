@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -604,6 +605,10 @@ func TestFormatVersionsReadsAsProse(t *testing.T) {
 // spinProbeEnv makes this test binary re-exec itself as the probe child.
 const spinProbeEnv = "SPHYRIX_AUTH_SPIN_PROBE"
 
+// spinProbeSentinel is what the child prints on success, so a child that never
+// ran cannot be mistaken for one that passed.
+const spinProbeSentinel = "spin-probe-ok"
+
 // The largest int32 must not spin. `token_version` is ORG-AUTHORED and the
 // reconciler validates it only as "an integer >= 1" — explicitly unbounded
 // above — so math.MaxInt32 is a value a tenant can put in its own repo. The
@@ -634,18 +639,30 @@ func TestTheAcceptedSetTerminatesAtTheLargestVersion(t *testing.T) {
 			fmt.Fprintf(os.Stderr, "RetiredBy(MaxInt32, MaxInt32) = %v\n", retired)
 			os.Exit(4)
 		}
+		// A sentinel the parent insists on. It does NOT prove the child ran the
+		// real calls — a gutted child could print it — but it does mean an
+		// empty or skipped child run cannot pass for a successful one.
+		fmt.Fprintf(os.Stderr, "%s %d %d %d\n", spinProbeSentinel, len(got), got[0], got[1])
 		os.Exit(0)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// t.Name(), never a literal: a stale -test.run matches zero tests, and
+	// `go test` reports "no tests to run" with exit 0 — which the parent would
+	// read as success. Renaming this function would have turned the only guard
+	// against a confirmed machine-OOMing loop into a no-op, silently.
 	cmd := exec.CommandContext(ctx, os.Args[0],
-		"-test.run=^TestTheAcceptedSetTerminatesAtTheLargestVersion$", "-test.timeout=45s")
+		"-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.timeout=45s")
 	cmd.Env = append(os.Environ(), spinProbeEnv+"=1", "GOMEMLIMIT=64MiB", "GOGC=10")
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("the bounded probe did not complete cleanly (%v) — the accepted-set loop is unbounded at math.MaxInt32.\nchild output:\n%s", err, output)
+	}
+	want := fmt.Sprintf("%s %d %d %d", spinProbeSentinel, LiveVersions, math.MaxInt32-1, math.MaxInt32)
+	if !strings.Contains(string(output), want) {
+		t.Fatalf("the probe child did not report %q — it did not run, so this guard proved nothing.\nchild output:\n%s", want, output)
 	}
 }
 
@@ -720,6 +737,19 @@ func TestEvidenceOptionalDropsTheUseCheckButKeepsTheInterval(t *testing.T) {
 	// And it does not turn off the other refusals either.
 	if err := lenient.CheckBump(RotationState{Applied: 3, AppliedAt: now.Add(-24 * time.Hour)}, 5); !errors.Is(err, ErrNotABump) {
 		t.Errorf("EvidenceOptional allowed a version skip: %v", err)
+	}
+
+	// EvidenceOptional is the ONLY value that waives anything. EvidencePolicy
+	// is an exported named int with exported-field access, so a config value,
+	// a cast or a third constant added out of order can all produce something
+	// this package does not recognise — and an unrecognised policy that came
+	// out LAX would silently disable half of the only revocation guardrail
+	// there is. Anything that is not the opt-out must stay strict.
+	for _, unknown := range []EvidencePolicy{EvidenceOptional + 1, EvidenceOptional + 7, -1} {
+		guard := BumpGuard{MinInterval: 15 * time.Minute, Now: clock, Evidence: unknown}
+		if err := guard.CheckBump(neverUsed, 3); !errors.Is(err, ErrVersionNotInUse) {
+			t.Errorf("EvidencePolicy(%d) gave %v, want ErrVersionNotInUse — an unrecognised policy must fail closed, never waive the check", unknown, err)
+		}
 	}
 }
 

@@ -114,4 +114,11 @@
 // can pick the new token up would retire a version somebody is still holding,
 // so the minimum interval and the evidence-of-use check belong in the tooling
 // rather than in an operator's head.
+//
+// The interval is never waivable. The evidence half is, through
+// [EvidencePolicy] — ADR 020 asks for "a minimum interval, OR a check that the
+// new version is in use", and a service that does not record last use would
+// otherwise find revocation unreachable. [EvidenceRequired] is the zero value
+// and every unrecognised value is strict too; [EvidenceOptional] is the one
+// opt-out, and it is a service-level setting rather than a per-incident knob.
 package auth

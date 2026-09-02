@@ -158,13 +158,21 @@ To retire a token that is live at version `N` (a leak, a compromise, an offboard
    `auth.BumpGuard.CheckBump` enforces that and refuses step 4 until it holds, naming which check
    failed; there is no way to spell "no interval".
 
-   **When nobody will ever use `N+1`:** the evidence half is waivable — set
-   `BumpGuard.Evidence = auth.EvidenceOptional` and the interval alone gates step 4. That is ADR
+   **When nobody will ever use `N+1`:** the evidence half is waivable, via
+   `BumpGuard.Evidence = auth.EvidenceOptional` — the interval alone then gates step 4. That is ADR
    020's *"a minimum interval, **or** a check that the new version is in use"*, and it is the right
    setting when the consumer has been offboarded, has not gone live yet, or sends too infrequently
-   to authenticate inside any sane window — otherwise the guardrail would block the only revocation
-   path there is. Rely on the ADR 019 delivery run record for who actually holds what; it is
+   to authenticate inside any sane window; otherwise the guardrail would block the only revocation
+   path there is. Rely on the ADR 019 delivery run record for who actually holds what — it is
    evidence `go/auth` cannot see.
+
+   **This is a service-level setting, not something you flip mid-incident.** It is decided once by
+   the verifying service, from whether that service records last use at all; an operator working
+   through this procedure has no way to set a Go struct field, and no control surface for a
+   per-org waiver exists in v1. A service that does not track last use **must** set
+   `EvidenceOptional`, or its only revocation path is unreachable in production. If step 4 is
+   refused for want of evidence and the service is configured strict, that is a service
+   configuration bug — escalate it, do not work around it.
 4. **Bump `token_version` from `N+1` to `N+2`** and merge. This mints `N+2` and **retires `N`** —
    the accepted set becomes `{N+1, N+2}`, and the compromised token stops authenticating. *This*
    commit is the revocation.
@@ -205,6 +213,37 @@ at-most-two invariant.
 > `https://github.com/sphyrix/contracts/blob/main/README.md#revoking-a-token-two-commits`. GitHub
 > derives that anchor from the heading text "Revoking a token: two commits", so editing the heading
 > silently breaks the runbook's link. `TestTheReadmeDocumentsTheTwoCommitRevocation` pins it.
+
+#### Writing the new token to Vault (`cas`) — ruling pending
+
+> **Undecided.** [#488](https://github.com/sphyrix/infrastructure/issues/488) arms the KV v2 mount
+> with `cas_required=true`. Mint-beside **overwrites** `kv/data/<org>/platform/<service>/token`, so
+> the write must carry `cas` = the secret's current version — and ADR 027 Decision 4 gives the
+> service `create`/`update` on `kv/data/+/platform/<service>/*` with *"no `read`, `delete` or
+> `kv/metadata` grant"*, so it cannot learn that number. This section is provisional until the
+> ruling lands; the seam below is not.
+
+`auth.TokenPathVersion` is where the number comes from, and it is deliberately one method so the
+ruling is a choice of implementation rather than a redesign:
+
+```go
+type TokenPathVersion interface {
+    CurrentVersion(ctx context.Context, org string) (int, error)
+}
+```
+
+| Candidate ruling | What `CurrentVersion` does | Cost |
+|---|---|---|
+| **1. Read `kv/metadata/+/platform/<service>/*`** (version, never value) | returns the version Vault reports | **amends ADR 027 Decision 4's grant list** — must be recorded on the ADR, as the 2026-09-02 `token_version` note was on ADR 020 |
+| **2. Service tracks the version** from its own hash rows | returns the count it recorded itself | no new Vault grant; the count is now state that can drift from Vault |
+| **3. One KV path per token version** | returns `0` always — every write is a create | **not writer-local**: ADR 027 Decision 5 mounts the KV *secret directory* at `/var/run/sphyrix/<org>/platform/<service>/` (never `subPath`), so this moves or multiplies what consumers mount and ripples into the rendered `VaultStaticSecret`, the `[vault].paths` glob, `TokenFromFile`'s path in every consumer, and ADR 019's delivery command |
+
+`go/auth` holds no Vault client and must never acquire one — hence `ctx`, an org and an `int`.
+
+An error from `CurrentVersion` **fails the mint**; never guess a value. A wrong `cas` is refused by
+Vault, which is the safe direction: nothing is written, no hash row is stored, and the next resync
+retries — exactly what ADR 027 Decision 3's Vault-first ordering already provides for.
+
 
 ## Editing the contract
 
