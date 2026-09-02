@@ -30,8 +30,11 @@ GitHub plays the schema-registry role:
 | `hello.v1` | `SayHello` — a v0 smoke test proving the contract pipeline (buf lint → buf breaking → proto-gen → committed SDK → build) end to end before the first real sphyrix-hosted-service package lands. | `gen/go/hello/v1` |
 | `email.v1` | `EmailService` (`SendEmail`, `GetMessage`) — the `email-service` API (design 001 §9.2). Postal's per-message token is deliberately not exposed. | `gen/go/email/v1` |
 
-`go/auth` (the shared M2M bearer middleware, ADR 027) lands in a follow-on story (Epic 9, Story
-9.3) on top of this scaffold.
+Alongside the generated stubs the module ships one hand-written package:
+
+| Package | Contents | Go import path |
+|---|---|---|
+| `auth` | The platform's shared machine-to-machine bearer middleware (ADR 027): server interceptor, client interceptor, `TokenFromFile`, and the token format itself. It lives here rather than in a library of its own because every sphyrix service and every caller needs it *with* the stubs. | `go/auth` |
 
 ## Consuming (Go)
 
@@ -48,8 +51,66 @@ import (
 
     emailv1 "github.com/sphyrix/contracts/gen/go/email/v1"
     "github.com/sphyrix/contracts/gen/go/email/v1/emailv1connect"
+
+    sphyrixauth "github.com/sphyrix/contracts/go/auth"
 )
 ```
+
+## M2M authentication (`go/auth`)
+
+Every sphyrix-hosted service authenticates north-south callers with one convention
+([ADR 027](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/027-platform-m2m-token-convention.md)),
+and `go/auth` is its only implementation — copy the convention, never the mechanism.
+
+A token is **`sphx_<service>_` + 32 bytes of `crypto/rand`, base64url without padding**. The
+`sphx_` prefix is there for **secret scanning**: it makes a leaked token greppable in a log, a
+repository or a CI artefact, and the `<service>` segment names the service that can verify it.
+
+Three rules bind everyone who touches one:
+
+1. **Never log the token** — not at debug, not in an error, not as a trace attribute. Nothing in
+   `go/auth` logs, formats or wraps a token or its hash into any message.
+2. **Never log the `authorization` header.** Gateway access logs and OpenTelemetry HTTP
+   attributes must drop it outright (design 001 §9.4).
+3. **Store only the hash.** A verifying service persists `auth.Hash(token)` — SHA-256, lowercase
+   hex — and looks it up as an *indexed key*. Verification is a lookup, never a comparison;
+   unsalted SHA-256 is right precisely because the token is 256 random bits, which is also why
+   bcrypt-class hashing buys nothing here.
+
+### Calling a sphyrix service
+
+```go
+client := emailv1connect.NewEmailServiceClient(http.DefaultClient,
+    "https://email.dev.sphyrix.cloud",
+    connect.WithInterceptors(sphyrixauth.NewClientInterceptor(
+        sphyrixauth.TokenFromFile("/var/run/sphyrix/becoming-the-hunter/platform/email/token"))))
+```
+
+`TokenFromFile` **re-reads the mounted file on change**, within `DefaultRefreshInterval`. That is
+not an optimisation to skip: the token is re-minted on every dev/test `up` and after a
+Postgres-only prod restore, so a consumer that caches it for the process lifetime breaks after
+every cycle and stays broken until somebody restarts it. Off-platform callers, which receive the
+token once into a CI secret store (ADR 019), use `sphyrixauth.StaticToken` instead.
+
+### Serving one
+
+```go
+interceptor, err := sphyrixauth.NewInterceptor("email", store) // store implements auth.TokenStore
+// ...
+mux.Handle(emailv1connect.NewEmailServiceHandler(svc, connect.WithInterceptors(interceptor)))
+```
+
+An absent, malformed, wrong-prefix, foreign-service or unknown token is one answer —
+`UNAUTHENTICATED`, with nothing that tells a prober which it was. A handler that has an
+authenticated caller and is asked for another org's resource answers `PERMISSION_DENIED`;
+`auth.AuthorizeOrg(ctx, resourceOrg)` is that check, and it takes the org read from the
+**resource**, never from the request. `auth.FromContext` reads the org the interceptor
+established.
+
+Rotation and revocation are not in v1 by decision (design 001 D-19). `auth.Identity.TokenVersion`
+carries ADR 027's `token_version` — constant `1` — so
+[ADR 020](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/020-m2m-token-rotation-and-revocation.md)
+can add them without changing this package's exported surface.
 
 ## Editing the contract
 
@@ -60,7 +121,8 @@ just proto-lint       # buf lint
 just proto-breaking   # buf breaking vs main — the compatibility gate
 just proto-gen        # regenerate gen/go (commit the result)
 just build            # prove the generated SDK compiles
-just test             # module tests
+just test             # module tests (the descriptor assertions and go/auth)
+just lint             # golangci-lint over the module
 ```
 
 Rules:
@@ -83,6 +145,7 @@ gen/go/hello/v1/                  # generated: protobuf types
 gen/go/hello/v1/hellov1connect/   # generated: connect-go handlers/clients
 gen/go/email/v1/                  # generated: protobuf types
 gen/go/email/v1/emailv1connect/   # generated: connect-go handlers/clients
+go/auth/                          # hand-written: the M2M bearer middleware (ADR 027)
 contractcheck/                    # cross-package descriptor assertions (e.g. no Postal secrets)
 docs/                             # design docs (000-, 001-, ...)
 ```
@@ -99,7 +162,7 @@ This repo is a structural mirror of `huntful-contracts` (design 001 §10). Recor
 | Visibility | private (`GO_MODULES_TOKEN`/`GOPRIVATE` required) | **public** — no credentials required |
 | Module | `github.com/BecomingTheHunter/huntful-contracts` | `github.com/sphyrix/contracts` |
 | Packages | `hello.v1`, `iam.v1`, `user.v1`, … (10 domain packages) | `hello.v1`, `email.v1` (Story 9.2); further `<domain>.v1` packages land per sphyrix-hosted service in follow-on stories |
-| Extra | — | `go/auth` — the M2M bearer middleware (ADR 027), lands in Story 9.3 |
+| Extra | — | `go/auth` — the M2M bearer middleware (ADR 027) |
 
 Implementation-detail differences not called out in §10's table, justified here:
 
