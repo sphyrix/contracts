@@ -17,12 +17,25 @@ type Identity struct {
 	// from [Interceptor].
 	Org string
 
-	// TokenVersion is ADR 027 Decision 8's `token_version`, carried so a
-	// handler can record which version authenticated a request. It is
-	// constant 1 in v1: rotation and revocation are ADR 020's, and this field
-	// exists so that ADR 020 is an additive change rather than a breaking one
-	// to this package's exported surface.
+	// TokenVersion is the `token_version` the PRESENTED token was minted at —
+	// design 001 §9.5's `tokens.version`, carried so a handler can record
+	// which version authenticated a request.
+	//
+	// It is not necessarily AppliedTokenVersion: during ADR 020's rotation
+	// window a consumer that has not cut over yet authenticates with the
+	// previous version, and that is the mechanism working, not a fault.
 	TokenVersion int32
+
+	// AppliedTokenVersion is the org's applied `token_version` — design 001
+	// §9.5's `orgs.token_version`, ADR 020's single control for rotation and
+	// revocation.
+	//
+	// A [TokenStore] MUST set it: [Interceptor] refuses the request outright
+	// if it is below [FirstTokenVersion], because a store that does not report
+	// the applied version is a store against which the accepted set cannot be
+	// checked, and treating that as "accept anything" would silently turn
+	// revocation off.
+	AppliedTokenVersion int32
 }
 
 // contextKey is unexported, so nothing outside this package can plant an

@@ -51,7 +51,16 @@ var secretEncodedLen = base64.RawURLEncoding.EncodedLen(SecretBytes)
 //
 // The verifying service mints on first sight of an org's declared config,
 // writes the plaintext to Vault FIRST and stores [Hash]'s output second (ADR
-// 027 Decision 3), and never reads Vault back. The plaintext returned here is
+// 027 Decision 3), and never reads a token VALUE back out of Vault.
+//
+// "Never reads Vault back" is qualified to values as of the 2026-09-02 ruling:
+// on an armed KV v2 mount the mint reads `kv/metadata/...` for the check-and-set
+// VERSION (see [TokenPathVersion] and [CASWriter]). That is the same
+// values-versus-metadata line that made the ADR 027 Decision 4 amendment
+// acceptable — the version is not the secret. No path in this package or in a
+// service following it reads a token value back.
+//
+// The plaintext returned here is
 // the only copy this process will ever hold: do not log it, do not put it in
 // an error, and drop it as soon as it has been written.
 //

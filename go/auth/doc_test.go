@@ -49,6 +49,40 @@ func TestThePackageDocumentsItsObligations(t *testing.T) {
 			what:     "that a mounted token is re-read on change",
 			together: []string{"tokenfromfile", "re-read"},
 		},
+		// ACCEPTANCE (Story 9.4): "The convention is described as platform-wide
+		// with token_version named as the single control, so a second sphyrix
+		// service copies it rather than inventing a `revoked` flag."
+		//
+		// This is the sentence that stops the second sphyrix service from
+		// solving revocation again, and the package doc is where its author
+		// will look. ADR 020 rejected a `revoked` field explicitly — a second
+		// control saying what a second bump already says — so the negative is
+		// asserted alongside the positive.
+		{
+			what:     "that token_version is the platform-wide single control",
+			together: []string{"token_version", "platform-wide", "single control"},
+		},
+		{
+			what:     "that a service must not invent a `revoked` flag of its own",
+			together: []string{"revoked", "invent"},
+		},
+		// ACCEPTANCE (Story 9.4): the two-commit procedure, stated explicitly.
+		{
+			what:     "that one bump mints and does not revoke",
+			together: []string{"one bump mints", "does not revoke"},
+		},
+		{
+			// "takes two commits", not "two commits": the same paragraph cites
+			// the README heading "Revoking a token: two commits" verbatim, so
+			// the looser phrase is satisfied by the citation even after the
+			// sentence that makes the claim is deleted.
+			what:     "that revoking takes two commits",
+			together: []string{"one bump mints", "takes two commits"},
+		},
+		{
+			what:     "that verification is against an accepted set of token_versions",
+			together: []string{"accepted set", "token_version"},
+		},
 	} {
 		if !anyParagraphContainsAll(paragraphs, want.together) {
 			t.Errorf("the package documentation does not say %s (looked for %q together in one paragraph)", want.what, want.together)

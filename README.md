@@ -34,7 +34,7 @@ Alongside the generated stubs the module ships one hand-written package:
 
 | Package | Contents | Go import path |
 |---|---|---|
-| `auth` | The platform's shared machine-to-machine bearer middleware (ADR 027): server interceptor, client interceptor, `TokenFromFile`, and the token format itself. It lives here rather than in a library of its own because every sphyrix service and every caller needs it *with* the stubs. | `go/auth` |
+| `auth` | The platform's shared machine-to-machine bearer middleware (ADR 027): server interceptor, client interceptor, `TokenFromFile`, the token format itself, and `token_version` rotation/revocation (ADR 020) — the accepted-set verifier and the bump guardrail. It lives here rather than in a library of its own because every sphyrix service and every caller needs it *with* the stubs. | `go/auth` |
 
 ## Consuming (Go)
 
@@ -100,6 +100,12 @@ interceptor, err := sphyrixauth.NewInterceptor("email", store) // store implemen
 mux.Handle(emailv1connect.NewEmailServiceHandler(svc, connect.WithInterceptors(interceptor)))
 ```
 
+`LookupTokenHash` must return **both** versions on the `Identity` it yields —
+`TokenVersion` (what the found row was minted at) and `AppliedTokenVersion` (the org's applied
+`token_version`). The interceptor checks the first against the accepted set derived from the
+second, and answers `INTERNAL` if either is missing: a store that cannot be version-checked must
+not be mistaken for one that accepts anything.
+
 An absent, malformed, wrong-prefix, foreign-service or unknown token is one answer —
 `UNAUTHENTICATED`, with nothing that tells a prober which it was. A handler that has an
 authenticated caller and is asked for another org's resource answers `PERMISSION_DENIED`;
@@ -107,10 +113,181 @@ authenticated caller and is asked for another org's resource answers `PERMISSION
 **resource**, never from the request. `auth.FromContext` reads the org the interceptor
 established.
 
-Rotation and revocation are not in v1 by decision (design 001 D-19). `auth.Identity.TokenVersion`
-carries ADR 027's `token_version` — constant `1` — so
-[ADR 020](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/020-m2m-token-rotation-and-revocation.md)
-can add them without changing this package's exported surface.
+### Rotating and revoking a token
+
+Rotation and revocation both ride on **one control**, and that control is `token_version`
+([ADR 020](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/020-m2m-token-rotation-and-revocation.md)).
+It is **platform-wide**: `token_version` is the single control for **every** platform M2M token of
+this class ([ADR 027](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/027-platform-m2m-token-convention.md)),
+so a second sphyrix service copies this convention rather than inventing a `revoked` flag, an
+expiry, or any other second source of truth about whether a token is live. ADR 020 considered and
+rejected a `revoked = true` field for exactly that reason: a second control saying what a second
+bump already says is a second thing to keep consistent.
+
+The version is **org-authored** — `[email].token_version` in the org's own tenant platform repo, an
+optional integer ≥ 1 defaulting to `1`. Rotation is self-service: an org rotates on its own
+schedule, with no custodian PR. (`1` is a *baseline*, not a constant — an org that has rotated is
+at `2` or more.)
+
+Raising it **mints the new token beside the current one**, and both authenticate. The verifier
+therefore checks an **accepted set** — `auth.AcceptedVersions` / `auth.VersionAccepted`, enforced by
+the interceptor on every request — which holds at most `auth.LiveVersions` (2) versions: `N` and
+`N-1`. `N-2` is refused. So there is never a window in which a consumer holds no valid token, and
+the consumer cuts over on its own schedule via whichever delivery path it has.
+
+#### Revoking a token: two commits
+
+> **One bump mints; it does not revoke.** Raising `token_version` by one adds the new version
+> *beside* the old one — the old token keeps working. The intuitive single edit is a **rotation**,
+> not a revocation, and reaching for it in an incident leaves the compromised token live. Revoking
+> takes **two commits**.
+
+To retire a token that is live at version `N` (a leak, a compromise, an offboarded consumer):
+
+1. **Bump `[email].token_version` from `N` to `N+1`** in the org's tenant platform repo, and merge.
+   The service mints version `N+1` **beside** `N`. Both authenticate. **Nothing is revoked yet** —
+   the accepted set is now `{N, N+1}`.
+2. **Deliver `N+1` to every consumer.** On-platform consumers need no action: VSO refreshes the
+   mounted `VaultStaticSecret` (`refreshAfter: 1m`) and `auth.TokenFromFile` re-reads it. For every
+   **off-platform** consumer, rerun the devtools delivery command
+   ([ADR 019](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/019-off-platform-m2m-token-delivery.md))
+   — its run record is the only inventory of who holds what. Skipping this step is what step 4
+   breaks.
+3. **Wait out the interval, and confirm `N+1` is actually in use.** At least
+   `auth.DefaultMinBumpInterval` (15 minutes) must have passed since step 1.
+   `auth.BumpGuard.CheckBump` enforces that and refuses step 4 until it holds, naming which check
+   failed; there is no way to spell "no interval".
+
+   **When nobody will ever use `N+1`:** the evidence half is waivable, via
+   `BumpGuard.Evidence = auth.EvidenceOptional` — the interval alone then gates step 4. That is ADR
+   020's *"a minimum interval, **or** a check that the new version is in use"*, and it is the right
+   setting when the consumer has been offboarded, has not gone live yet, or sends too infrequently
+   to authenticate inside any sane window; otherwise the guardrail would block the only revocation
+   path there is. Rely on the ADR 019 delivery run record for who actually holds what — it is
+   evidence `go/auth` cannot see.
+
+   **This is a service-level setting, not something you flip mid-incident.** It is decided once by
+   the verifying service, from whether that service records last use at all; an operator working
+   through this procedure has no way to set a Go struct field, and no control surface for a
+   per-org waiver exists in v1. A service that does not track last use **must** set
+   `EvidenceOptional`, or its only revocation path is unreachable in production. If step 4 is
+   refused for want of evidence and the service is configured strict, that is a service
+   configuration bug — escalate it, do not work around it.
+4. **Bump `token_version` from `N+1` to `N+2`** and merge. This mints `N+2` and **retires `N`** —
+   the accepted set becomes `{N+1, N+2}`, and the compromised token stops authenticating. *This*
+   commit is the revocation.
+
+**If you skip a version by mistake** — declaring `N+3` while `N+1` is applied — the bump is refused
+permanently, and no custodian can lift it: applying several at once would retire versions consumers
+may still hold. **Revert the mistaken edit.** The value you declared before the skip *is*
+`applied + 1`, whether the previous bump was applied or is still being held by the guardrail (a held
+bump does not move the applied version), so your own git history is the recovery. Lowering below the
+applied version is refused too, so `applied + 1` is the only safe target.
+
+You cannot read the applied version yourself — it is `orgs.token_version` in the service's database,
+and the refusal surfaces on `orgs.last_error` / `email_org_ready{org}`, both custodian-side. If your
+history is unclear, ask the custodian to **read** it out for you. That is a read, not an override:
+there is still no custodian-side way to bump or revoke on your behalf.
+
+Exposure is therefore bounded by how fast the two commits are made, not by an instant kill — the
+accepted trade for zero-downtime rotation through one control (ADR 020, Consequences). There is no
+custodian-side override in v1: sphyrix cannot revoke an org's token without that org committing the
+bumps.
+
+The guardrail in step 3 exists because bumping twice faster than consumers can pick the new token up
+retires a version somebody is still using. It belongs in the tooling, not in an operator's head:
+
+```go
+guard := sphyrixauth.BumpGuard{} // DefaultMinBumpInterval, real clock, evidence required
+err := guard.CheckBump(sphyrixauth.RotationState{
+    Applied:           applied,    // orgs.token_version
+    AppliedAt:         appliedAt,  // tokens.created_at for that version
+    AppliedLastUsedAt: lastUsedAt, // see below — NOT a column design 001 §9.5 has
+}, declared)                       // the org's newly declared token_version
+```
+
+`Applied` and `AppliedAt` come straight out of design 001 §9.5. **`AppliedLastUsedAt` does not** —
+there is no last-used column on `orgs` or `tokens`, and Story 11.2 does not add one. Recording it
+costs a write on the authentication path, so it is a deliberate choice: a service that does not
+track it leaves the field zero and sets `Evidence: auth.EvidenceOptional`.
+
+A refusal never reaches the org — the bump is already merged in the org's own repo — so the service
+must surface a held bump where an operator will see it (`orgs.last_error`, `email_org_ready{org}`).
+Otherwise an incident responder merges step 4, sees the repo say `N+2`, and believes the compromised
+token is dead while the service is still at `N+1` with `N` live.
+
+A refusal means **hold the whole bump** — mint nothing and retire nothing — and report the reason.
+Applying the mint while deferring the retirement would put three versions in flight and break the
+at-most-two invariant.
+
+> **Anchor — do not rename the heading.** `docs/runbooks/email-onboarding.md` in
+> `sphyrix/infrastructure` (Story 12.3) links to the procedure above as
+> `https://github.com/sphyrix/contracts/blob/main/README.md#revoking-a-token-two-commits`. GitHub
+> derives that anchor from the heading text "Revoking a token: two commits", so editing the heading
+> silently breaks the runbook's link. `TestTheReadmeDocumentsTheTwoCommitRevocation` pins it.
+
+#### Writing the new token to Vault (`cas`)
+
+[#488](https://github.com/sphyrix/infrastructure/issues/488) arms the KV v2 mount with
+`cas_required=true`, and mint-beside **overwrites** `kv/data/<org>/platform/<service>/token` — so
+the write must carry `cas` = the secret's current version.
+
+> **ADR 027 Decision 4 amendment (human ruling, 2026-09-02).** Decision 4 originally granted the
+> verifying service `create`/`update` on `kv/data/+/platform/<service>/*` with *"no `read`, `delete`
+> or `kv/metadata` grant"*, which left it unable to learn the number it is required to send. It now
+> also gets **`read` on `kv/metadata/+/platform/<service>/*`, and only there** — that path yields
+> the **version, never the value**, so token values stay unreadable across orgs and the narrow
+> cross-tenant write path is otherwise unchanged. #488 records the same ruling as ADR 024
+> Amendment 4.
+>
+> Decision 3's *"never reads Vault back"* is qualified to **values** by the same ruling: the mint
+> reads `kv/metadata/...` for the version and never reads a token value back. The version is not
+> the secret — which is the line that made this amendment acceptable in the first place.
+
+The bump is therefore: **metadata read → write with `cas=<current version>`**, and on a refusal,
+re-read and try again, bounded. `auth.CASWriter` is that procedure:
+
+```go
+err := sphyrixauth.CASWriter{Version: metadataReader}.Write(ctx, org,
+    func(ctx context.Context, cas int) error {
+        // write kv/data/<org>/platform/<service>/token with this cas;
+        // return auth.ErrCASRefused when Vault rejects it
+    })
+```
+
+The re-read is the whole point: retrying with the same `cas` cannot succeed, because the version is
+exactly what was wrong. Only `ErrCASRefused` is retried — any other write error fails the mint at
+once, since retrying an error whose cause is unknown is how a bounded loop becomes an unbounded one.
+
+A refused `cas` means the path moved between the read and the write. Under ADR 027 Decision 5 that
+is normally the **tenant itself**, which holds `tenant-rw` on its own path. After
+`auth.DefaultCASAttempts` (3) the mint gives up with `auth.ErrCASExhausted` and **nothing is
+written** — not terminal for the org, since ADR 027 Decision 3 has the next resync retry the whole
+mint, so the budget is three per resync rather than three ever — report that loudly, on the same channel as a held bump (`orgs.last_error`,
+`email_org_ready{org}`). It means something is rewriting an org's token path repeatedly, and a mint
+that gave up quietly would leave the org with no new token and nobody looking.
+
+**Platform-wide rule: the version never appears in the path.** `token_version` is a property of the
+row, not of the address — the Vault path is the same for every version. That is what lets ADR 027
+Decision 5 mount the KV *secret directory* (never `subPath`) and lets ADR 020 promise that *"Vault
+continues to present the current token … no consumer ever has to hold two"*. A service that put the
+version in the path would move the mount and make every consumer discover which version to read.
+
+The version source stays behind `auth.TokenPathVersion`:
+
+```go
+type TokenPathVersion interface {
+    CurrentVersion(ctx context.Context, org string) (int, error)
+}
+```
+
+The **metadata read is the ruled and supported implementation**; the seam is kept because a service
+that tracks the version itself satisfies the same contract, but a service that invents another
+source is off the platform convention. `go/auth` holds no Vault client and must never acquire one —
+hence `ctx`, an org and an `int`. An error from `CurrentVersion` **fails the mint**: never guess a
+`cas`. A wrong one is refused by Vault, which is the safe direction — nothing is written, no hash
+row is stored, and the next resync retries, exactly as ADR 027 Decision 3's Vault-first ordering
+provides for.
 
 ## Editing the contract
 
