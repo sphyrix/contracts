@@ -74,13 +74,13 @@ func OrgFromContext(ctx context.Context) (string, bool) {
 func AuthorizeOrg(ctx context.Context, resourceOrg string) error {
 	identity, ok := FromContext(ctx)
 	if !ok {
-		return errUnauthenticated
+		return errUnauthenticated()
 	}
 	// An unowned resource belongs to nobody, so it belongs to no caller
 	// either; identity.Org is never empty, but neither half is trusted to be
 	// non-empty here, because "" == "" must never authorize anything.
 	if identity.Org == "" || resourceOrg == "" || identity.Org != resourceOrg {
-		return errPermissionDenied
+		return errPermissionDenied()
 	}
 	return nil
 }

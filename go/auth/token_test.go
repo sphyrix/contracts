@@ -207,11 +207,18 @@ func entropyFailures(t *testing.T, read func([]byte) (int, error)) []string {
 		secrets = append(secrets, raw)
 	}
 
-	// Every one of the 256 bits must vary. Over 512 draws, a bit that is
-	// genuinely random is set between 40% and 60% of the time with
-	// overwhelming probability (~12 standard deviations from the bound), while
-	// a bit that is structurally 0 or 1 — the high bits of a counter, every
-	// bit of a constant — sits at 0% or 100%.
+	// Every one of the 256 bits must vary. The band has to be wide enough that
+	// a genuinely random draw never trips it: over 512 samples one standard
+	// deviation is 11.3 counts, so a 40-60% band sits only 4.5σ out and fails
+	// spuriously about once in 800 runs across 256 bits — a flake this suite
+	// would eventually hit. 30-70% is 9σ (p < 1e-15 per run) and still catches
+	// everything this check is for, because a bit that is structurally 0 or 1
+	// — the high bits of a counter, every bit of a constant — sits at exactly
+	// 0% or 100%, not near the boundary.
+	const (
+		lowerBound = 0.30
+		upperBound = 0.70
+	)
 	for bit := range SecretBytes * 8 {
 		set := 0
 		for _, secret := range secrets {
@@ -220,7 +227,7 @@ func entropyFailures(t *testing.T, read func([]byte) (int, error)) []string {
 			}
 		}
 		ratio := float64(set) / float64(len(secrets))
-		if ratio < 0.4 || ratio > 0.6 {
+		if ratio < lowerBound || ratio > upperBound {
 			failures = append(failures, fmt.Sprintf("bit %d is set in %.0f%% of secrets", bit, ratio*100))
 		}
 	}

@@ -279,7 +279,10 @@ func TestTokenFromFileRejectsContentThatIsNotAToken(t *testing.T) {
 		"an embedded space":   minted[:10] + " " + minted[10:],
 		"a header injection":  minted + "\r\nx-sphyrix-admin: true",
 		"an embedded NUL":     minted[:10] + "\x00" + minted[10:],
-		"absurdly long":       strings.Repeat("a", maxTokenLen+1),
+		// A literal length, not one derived from the constant: deriving it
+		// would let the bound be raised to anything at all without the test
+		// noticing.
+		"absurdly long": strings.Repeat("a", 513),
 	} {
 		path := filepath.Join(dir, "token")
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
@@ -323,6 +326,15 @@ func TestTokenFromFileHonoursContextCancellation(t *testing.T) {
 	}
 }
 
+// TestTokenFromFileIsSafeForConcurrentUse exercises the shared-source path
+// every request of a client takes.
+//
+// Be clear about what it proves: without `-race` it only shows the source does
+// not crash or corrupt its answer under load — removing the mutex leaves it
+// green. It is the RACE DETECTOR that turns it into an assertion, and the
+// devtools container runs with CGO_ENABLED=0, where `-race` is unavailable. So
+// CI does not check this property; `go test -race ./...` on a cgo-enabled host
+// does, and that is where a change to the locking must be run.
 func TestTokenFromFileIsSafeForConcurrentUse(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "token")
 	minted, err := Mint("email")
@@ -465,11 +477,26 @@ func TestNewClientInterceptorRefusesANilSource(t *testing.T) {
 	NewClientInterceptor(nil)
 }
 
+// TestTheTokenLengthBoundIsWhatItSays pins the bound itself. A token is about
+// 55 characters; 512 is headroom, and a bound that could be silently raised to
+// anything would not be a bound.
+func TestTheTokenLengthBoundIsWhatItSays(t *testing.T) {
+	if maxTokenLen != 512 {
+		t.Errorf("maxTokenLen is %d, want 512", maxTokenLen)
+	}
+	if _, err := StaticToken(strings.Repeat("a", 512)).Token(context.Background()); err != nil {
+		t.Errorf("a 512-character token was refused: %v", err)
+	}
+	if _, err := StaticToken(strings.Repeat("a", 513)).Token(context.Background()); err == nil {
+		t.Error("a 513-character token was accepted")
+	}
+}
+
 func TestStaticTokenRefusesAnUnusableValue(t *testing.T) {
 	if got, err := StaticToken("sphx_email_ok").Token(context.Background()); err != nil || got != "sphx_email_ok" {
 		t.Errorf("a usable token was rejected: %q, %v", got, err)
 	}
-	for _, value := range []string{"", "  ", "a\nb", strings.Repeat("a", maxTokenLen+1)} {
+	for _, value := range []string{"", "  ", "a\nb", strings.Repeat("a", 513)} {
 		if _, err := StaticToken(value).Token(context.Background()); err == nil {
 			t.Errorf("StaticToken(%q) was accepted", value)
 		}

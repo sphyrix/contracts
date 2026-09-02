@@ -121,6 +121,13 @@ func TokenFromFile(path string, opts ...FileOption) *FileTokenSource {
 
 // Token implements [TokenSource].
 //
+// The lock is deliberately held across the file read. It costs a herd of
+// concurrent callers one blocked read — after which they all hit the freshly
+// filled cache — where a lock released before the read would have every
+// goroutine reading the file at once. The trade is that a wedged mount blocks
+// every in-flight request rather than only the first; do not "fix" this into a
+// read per goroutine without weighing that.
+//
 // A read that fails is returned as an error and DROPS the cached token: a
 // value read before the file was deleted or emptied is not evidence that the
 // caller may still use it. ADR 027 Decision 5 already accepts a bounded window
@@ -249,15 +256,28 @@ func (c *ClientInterceptor) attach(ctx context.Context, header http.Header) erro
 // stream's first use. connect's streaming client interceptor cannot return an
 // error at wrap time, and returning the unauthenticated connection unchanged
 // would send the stream without credentials.
+//
+// Closing is forwarded to the connection underneath before the error is
+// reported: the duplex call was already opened by the time the token was
+// found to be missing, so swallowing Close would leak it for the life of the
+// process.
 type failedStreamingClientConn struct {
 	connect.StreamingClientConn
 	err error
 }
 
-func (c *failedStreamingClientConn) Send(any) error       { return c.err }
-func (c *failedStreamingClientConn) Receive(any) error    { return c.err }
-func (c *failedStreamingClientConn) CloseRequest() error  { return c.err }
-func (c *failedStreamingClientConn) CloseResponse() error { return c.err }
+func (c *failedStreamingClientConn) Send(any) error    { return c.err }
+func (c *failedStreamingClientConn) Receive(any) error { return c.err }
+
+func (c *failedStreamingClientConn) CloseRequest() error {
+	_ = c.StreamingClientConn.CloseRequest()
+	return c.err
+}
+
+func (c *failedStreamingClientConn) CloseResponse() error {
+	_ = c.StreamingClientConn.CloseResponse()
+	return c.err
+}
 
 // usableAsHeaderValue accepts only visible ASCII with no spaces — which every
 // token minted by [Mint] is, being base64url and underscores. It exists to

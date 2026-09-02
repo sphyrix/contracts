@@ -118,9 +118,19 @@ func newHarness(t *testing.T, handler *helloHandler, opts ...Option) *harness {
 // authorization sends no header at all.
 func (h *harness) call(t *testing.T, authorization *string) (string, error) {
 	t.Helper()
+	if authorization == nil {
+		return h.callWith(t)
+	}
+	return h.callWith(t, *authorization)
+}
+
+// callWith makes one request carrying exactly the given Authorization headers
+// — none, one, or several.
+func (h *harness) callWith(t *testing.T, authorizations ...string) (string, error) {
+	t.Helper()
 	req := connect.NewRequest(&hellov1.SayHelloRequest{Name: "sphyrix"})
-	if authorization != nil {
-		req.Header().Set("Authorization", *authorization)
+	for _, authorization := range authorizations {
+		req.Header().Add("Authorization", authorization)
 	}
 	res, err := h.client.SayHello(context.Background(), req)
 	if err != nil {
@@ -239,25 +249,27 @@ func TestEveryBadTokenIsUnauthenticated(t *testing.T) {
 
 	raw := func(v string) *string { return &v }
 	cases := map[string]*string{
-		"absent":                              nil,
-		"an empty header":                     raw(""),
-		"the scheme alone":                    raw("Bearer"),
-		"the scheme and nothing else":         raw("Bearer "),
-		"whitespace after the scheme":         raw("Bearer    "),
-		"malformed — no scheme":               raw(valid),
-		"malformed — the wrong scheme":        raw("Basic " + valid),
-		"malformed — a Vault-ish token":       bearer("hvs.CAESIJ2example"),
-		"malformed — random text":             bearer("not a token at all"),
-		"the wrong prefix":                    bearer("ghp_email_" + secret),
-		"no prefix":                           bearer("email_" + secret),
-		"a lookalike prefix":                  bearer("sphx-email_" + secret),
-		"the right prefix, another service":   bearer(foreign),
-		"the right prefix, no service":        bearer("sphx__" + secret),
-		"the right prefix, a short secret":    bearer("sphx_email_" + secret[:20]),
-		"the right prefix, a padded secret":   bearer("sphx_email_" + secret + "=="),
-		"the right prefix, unknown to us":     bearer(unknown),
-		"a valid token with a suffix":         bearer(valid + "x"),
-		"a valid token that has been upcased": bearer(strings.ToUpper(valid)),
+		"absent":                               nil,
+		"an empty header":                      raw(""),
+		"the scheme alone":                     raw("Bearer"),
+		"the scheme and nothing else":          raw("Bearer "),
+		"whitespace after the scheme":          raw("Bearer    "),
+		"malformed — no scheme":                raw(valid),
+		"malformed — the wrong scheme":         raw("Basic " + valid),
+		"a scheme that merely starts the same": raw("Bearerx " + valid),
+		"a six-character scheme":               raw("Basicx " + valid),
+		"malformed — a Vault-ish token":        bearer("hvs.CAESIJ2example"),
+		"malformed — random text":              bearer("not a token at all"),
+		"the wrong prefix":                     bearer("ghp_email_" + secret),
+		"no prefix":                            bearer("email_" + secret),
+		"a lookalike prefix":                   bearer("sphx-email_" + secret),
+		"the right prefix, another service":    bearer(foreign),
+		"the right prefix, no service":         bearer("sphx__" + secret),
+		"the right prefix, a short secret":     bearer("sphx_email_" + secret[:20]),
+		"the right prefix, a padded secret":    bearer("sphx_email_" + secret + "=="),
+		"the right prefix, unknown to us":      bearer(unknown),
+		"a valid token with a suffix":          bearer(valid + "x"),
+		"a valid token that has been upcased":  bearer(strings.ToUpper(valid)),
 	}
 
 	for name, authorization := range cases {
@@ -274,6 +286,31 @@ func TestEveryBadTokenIsUnauthenticated(t *testing.T) {
 		if got, want := err.Error(), "unauthenticated"; !strings.Contains(got, want) {
 			t.Errorf("%s: the message is %q, want the one contentless answer %q", name, got, want)
 		}
+	}
+
+	// A request carrying two Authorization headers is ambiguous: RFC 7235 §4.2
+	// allows one, and a credential that depends on which hop reads it is not a
+	// credential. Both orderings are refused, including the one whose FIRST
+	// header is the valid token.
+	for name, headers := range map[string][]string{
+		"valid then rubbish": {"Bearer " + valid, "Bearer nonsense"},
+		"rubbish then valid": {"Bearer nonsense", "Bearer " + valid},
+		"the same twice":     {"Bearer " + valid, "Bearer " + valid},
+	} {
+		if _, err := h.callWith(t, headers...); connect.CodeOf(err) != connect.CodeUnauthenticated {
+			t.Errorf("two Authorization headers (%s): got %v, want %v", name, connect.CodeOf(err), connect.CodeUnauthenticated)
+		}
+	}
+
+	// The scheme is matched case-insensitively (RFC 7235 §2.1), so the
+	// lowercase and uppercase forms must SUCCEED. Without these the
+	// case-insensitivity could be dropped for an exact "Bearer " comparison and
+	// nothing would notice.
+	if org, err := h.call(t, raw("bearer "+valid)); err != nil || org != "becoming-the-hunter" {
+		t.Errorf("a lowercase `bearer` scheme was refused (org=%q): %v", org, err)
+	}
+	if org, err := h.call(t, raw("BEARER "+valid)); err != nil || org != "becoming-the-hunter" {
+		t.Errorf("an uppercase `BEARER` scheme was refused (org=%q): %v", org, err)
 	}
 
 	// And the control: the same harness admits the valid token, so the table
@@ -426,10 +463,21 @@ func TestExemptProceduresRunWithoutAToken(t *testing.T) {
 	}
 
 	// A procedure that was not exempted still needs a token — otherwise
-	// "exempt" would be indistinguishable from "no auth at all".
-	other := newHarness(t, &helloHandler{}, WithExemptProcedures("/hello.v1.HelloService/SomethingElse"))
-	if _, err := other.call(t, nil); connect.CodeOf(err) != connect.CodeUnauthenticated {
-		t.Errorf("a non-exempt procedure was allowed through: %v", err)
+	// "exempt" would be indistinguishable from "no auth at all". The near-miss
+	// names pin the matching as EXACT: a prefix or suffix rule would exempt
+	// more procedures than the operator named, which is precisely the silently
+	// public endpoint the option's doc warns about.
+	for name, exempt := range map[string]string{
+		"an unrelated procedure":   "/hello.v1.HelloService/SomethingElse",
+		"a prefix of the live one": "/hello.v1.HelloService/SayHell",
+		"a suffix of the live one": "hello.v1.HelloService/SayHello",
+		"the package alone":        "/hello.v1.HelloService/",
+		"the live one, upcased":    "/hello.v1.HelloService/SAYHELLO",
+	} {
+		other := newHarness(t, &helloHandler{}, WithExemptProcedures(exempt))
+		if _, err := other.call(t, nil); connect.CodeOf(err) != connect.CodeUnauthenticated {
+			t.Errorf("%s (%q) exempted the live procedure: %v", name, exempt, err)
+		}
 	}
 }
 

@@ -10,11 +10,15 @@
 // # The token
 //
 // A token is `sphx_<service>_` + 32 bytes of crypto/rand, base64url-encoded
-// without padding (ADR 027 Decision 1) — for example
-// `sphx_email_hOJ2v9d0Lq3nR7xTfB1cYw5sM8kPzA4eG6uH0iJ2lN3`. [Mint] is the only
-// way to make one. The `sphx_` prefix exists for SECRET SCANNING: it makes a
+// without padding (ADR 027 Decision 1): `sphx_email_` followed by 43 base64url
+// characters. No example token is written out anywhere in this repository, and
+// none should be — a shape-valid literal in the package every tenant reads
+// would match the very scanners the next paragraph exists to feed. [Mint] is
+// the only way to make one. The `sphx_` prefix exists for SECRET SCANNING: it
+// makes a
 // leaked token greppable in a log, a repository or a CI artefact, and the
-// `<service>` segment names the service that can verify it.
+// `<service>` segment — the service's platform name, `email` rather than
+// `email-service` — names the service that can verify it.
 //
 // # Obligations on every caller of this package
 //

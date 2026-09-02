@@ -15,17 +15,32 @@ const (
 	bearerPrefix        = "Bearer "
 )
 
-// The errors a caller ever sees from this package. All four are contentless
-// on purpose: ADR 027 Decision 6 gives one answer to every failed
-// authentication, so an absent token, a malformed one, one minted for another
-// service and one no org holds are indistinguishable to a prober. None of them
-// carries the token, the hash, or anything read from the store.
-var (
-	errUnauthenticated  = connect.NewError(connect.CodeUnauthenticated, errors.New("unauthenticated"))
-	errPermissionDenied = connect.NewError(connect.CodePermissionDenied, errors.New("this org may not access that resource"))
-	errUnavailable      = connect.NewError(connect.CodeUnavailable, errors.New("the caller's identity could not be checked"))
-	errInternal         = connect.NewError(connect.CodeInternal, errors.New("the caller's identity could not be established"))
-)
+// The errors a caller ever sees from this package. All four are contentless on
+// purpose: ADR 027 Decision 6 gives one answer to every failed authentication,
+// so an absent token, a malformed one, one minted for another service and one
+// no org holds are indistinguishable to a prober. None of them carries the
+// token, the hash, or anything read from the store.
+//
+// They are built per call rather than shared as package-level values because
+// connect.Error.Meta() lazily allocates on its receiver: one shared value
+// handed to concurrent requests would be a data race the moment any
+// downstream interceptor annotated it, and whatever it was annotated with
+// would then be attached to every later caller's error.
+func errUnauthenticated() error {
+	return connect.NewError(connect.CodeUnauthenticated, errors.New("unauthenticated"))
+}
+
+func errPermissionDenied() error {
+	return connect.NewError(connect.CodePermissionDenied, errors.New("this org may not access that resource"))
+}
+
+func errUnavailable() error {
+	return connect.NewError(connect.CodeUnavailable, errors.New("the caller's identity could not be checked"))
+}
+
+func errInternal() error {
+	return connect.NewError(connect.CodeInternal, errors.New("the caller's identity could not be established"))
+}
 
 // Interceptor is ADR 027 Decision 6 and design 001 §9.4's auth middleware: the
 // one place a sphyrix-hosted service sees an M2M token.
@@ -175,7 +190,7 @@ func (i *Interceptor) authenticate(ctx context.Context, procedure string, header
 	if !ok {
 		// Absent, or not `Bearer <something>`.
 		i.logger.DebugContext(ctx, "request carries no bearer token", "procedure", procedure)
-		return nil, errUnauthenticated
+		return nil, errUnauthenticated()
 	}
 
 	// Shape first, so a value that cannot be one of our tokens never becomes a
@@ -185,7 +200,7 @@ func (i *Interceptor) authenticate(ctx context.Context, procedure string, header
 	if !ok || service != i.service {
 		i.logger.DebugContext(ctx, "bearer token is not shaped like a token for this service",
 			"procedure", procedure, "service", i.service)
-		return nil, errUnauthenticated
+		return nil, errUnauthenticated()
 	}
 
 	// The plaintext ends here. Everything below sees only the hash.
@@ -193,14 +208,14 @@ func (i *Interceptor) authenticate(ctx context.Context, procedure string, header
 	switch {
 	case errors.Is(err, ErrTokenNotFound):
 		i.logger.DebugContext(ctx, "no org holds that token", "procedure", procedure)
-		return nil, errUnauthenticated
+		return nil, errUnauthenticated()
 	case err != nil:
 		// Ours, not the caller's: the same token may well be valid. Saying
 		// UNAUTHENTICATED here would tell a caller to go and fetch a new token
 		// during a database outage, and would hide the outage from whoever is
 		// watching the error codes.
 		i.logger.WarnContext(ctx, "the token store could not be read", "procedure", procedure, "err", err)
-		return nil, errUnavailable
+		return nil, errUnavailable()
 	}
 
 	if identity.Org == "" {
@@ -209,7 +224,7 @@ func (i *Interceptor) authenticate(ctx context.Context, procedure string, header
 		// token: an empty org would authorize nothing under [AuthorizeOrg],
 		// but it would still let a handler run.
 		i.logger.ErrorContext(ctx, "the token store returned an empty org", "procedure", procedure)
-		return nil, errInternal
+		return nil, errInternal()
 	}
 
 	return NewContext(ctx, identity), nil
@@ -218,8 +233,16 @@ func (i *Interceptor) authenticate(ctx context.Context, procedure string, header
 // bearerToken pulls the token out of `Authorization: Bearer <token>`. The
 // scheme is matched case-insensitively (RFC 7235 §2.1) and everything else is
 // refused. The token is never logged, here or anywhere.
+//
+// A request carrying more than one Authorization header is refused rather than
+// resolved: RFC 7235 §4.2 allows exactly one, and a credential that depends on
+// which hop reads it is not a credential.
 func bearerToken(header http.Header) (string, bool) {
-	value := header.Get(authorizationHeader)
+	values := header.Values(authorizationHeader)
+	if len(values) != 1 {
+		return "", false
+	}
+	value := values[0]
 	if len(value) <= len(bearerPrefix) || !strings.EqualFold(value[:len(bearerPrefix)], bearerPrefix) {
 		return "", false
 	}
