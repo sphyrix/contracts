@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -161,18 +162,51 @@ func TestMintDrawsFullEntropy(t *testing.T) {
 		n++
 		return len(b), nil
 	}
+	// The three sources above are all caught by the uniqueness check alone, so
+	// on their own they never exercise the bit-distribution band below them —
+	// the band would be a check with no proof it can fire. This fourth source
+	// is UNIQUE on every draw (a 32-bit counter, so no repeat inside a sample)
+	// and still structurally biased: 224 of the 256 bits are always zero. Only
+	// the band catches it.
+	var wide uint32
+	biasedButUnique := func(b []byte) (int, error) {
+		for i := range b {
+			b[i] = 0
+		}
+		binary.BigEndian.PutUint32(b[:4], wide)
+		wide++
+		return len(b), nil
+	}
 
 	if failures := entropyFailures(t, rand.Read); len(failures) != 0 {
 		t.Errorf("crypto/rand failed the entropy checks: %s", strings.Join(failures, "; "))
 	}
 	for name, source := range map[string]func([]byte) (int, error){
-		"all zeros":    zeros,
-		"one constant": constant,
-		"a counter":    counter,
+		"all zeros":               zeros,
+		"one constant":            constant,
+		"a counter":               counter,
+		"unique but 32 bits wide": biasedButUnique,
 	} {
 		if failures := entropyFailures(t, source); len(failures) == 0 {
 			t.Errorf("%s passed the entropy checks — the checks cannot fail and prove nothing", name)
 		}
+	}
+
+	// And specifically: the fourth source must be caught by the BAND, not by
+	// one of the cheaper checks. Without this, opening the band to accept
+	// everything would still leave the table above green.
+	failures := entropyFailures(t, biasedButUnique)
+	var bandFired bool
+	for _, failure := range failures {
+		if strings.Contains(failure, "is set in") {
+			bandFired = true
+		}
+		if strings.Contains(failure, "same secret") {
+			t.Errorf("the 32-bit source repeated a secret; it no longer isolates the distribution band: %s", failure)
+		}
+	}
+	if !bandFired {
+		t.Errorf("the bit-distribution band never fired — it is a check with no proof it can fail (failures were %v)", failures)
 	}
 }
 

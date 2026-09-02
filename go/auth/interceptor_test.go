@@ -557,6 +557,46 @@ func TestNothingLogsOrReturnsTheToken(t *testing.T) {
 	}
 }
 
+// TestTheContentlessErrorsAreNotShared pins the reason they are built per call
+// rather than kept as package-level values.
+//
+// connect.Error.Meta() lazily allocates on its receiver. A shared value handed
+// to concurrent requests is therefore a data race the moment any downstream
+// interceptor annotates it — and whatever it was annotated with would then ride
+// along on every later caller's error. Without this assertion, a future "these
+// allocations are wasteful" refactor reintroduces both silently.
+func TestTheContentlessErrorsAreNotShared(t *testing.T) {
+	for name, build := range map[string]func() error{
+		"UNAUTHENTICATED":   errUnauthenticated,
+		"PERMISSION_DENIED": errPermissionDenied,
+		"UNAVAILABLE":       errUnavailable,
+		"INTERNAL":          errInternal,
+	} {
+		first, second := build(), build()
+
+		firstErr, ok := first.(*connect.Error)
+		if !ok {
+			t.Fatalf("%s: %T is not a *connect.Error", name, first)
+		}
+		secondErr, ok := second.(*connect.Error)
+		if !ok {
+			t.Fatalf("%s: %T is not a *connect.Error", name, second)
+		}
+		if firstErr == secondErr {
+			t.Errorf("%s: two calls returned the same *connect.Error", name)
+			continue
+		}
+
+		firstErr.Meta().Set("X-Poisoned", "1")
+		if got := secondErr.Meta().Get("X-Poisoned"); got != "" {
+			t.Errorf("%s: annotating one error changed another — the value is shared", name)
+		}
+		if got := build().(*connect.Error).Meta().Get("X-Poisoned"); got != "" {
+			t.Errorf("%s: a freshly built error carries an annotation from an earlier one", name)
+		}
+	}
+}
+
 func TestNewInterceptorRefusesAWiringMistake(t *testing.T) {
 	if _, err := NewInterceptor("email", nil); err == nil {
 		t.Error("NewInterceptor accepted a nil TokenStore")

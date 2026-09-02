@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"connectrpc.com/connect"
 
+	hellov1 "github.com/sphyrix/contracts/gen/go/hello/v1"
 	"github.com/sphyrix/contracts/gen/go/hello/v1/hellov1connect"
 )
 
@@ -138,21 +140,111 @@ func TestTheStreamingHandlerHonoursExemptProcedures(t *testing.T) {
 }
 
 // TestTheServerInterceptorLeavesOutboundStreamsAlone: the server half is an
-// inbound control, so wrapping a streaming CLIENT must be the identity.
+// inbound control, so wrapping a streaming CLIENT must be the IDENTITY — the
+// same connection back, untouched.
+//
+// "next was called" is not that property: a wrapper that returned a decorated
+// connection, or stamped a header of its own on the way past, would satisfy it.
+// So this asserts the connection's identity and that nothing was written to it.
 func TestTheServerInterceptorLeavesOutboundStreamsAlone(t *testing.T) {
-	interceptor, err := NewInterceptor("email", newRecordingStore())
+	store := newRecordingStore()
+	interceptor, err := NewInterceptor("email", store)
 	if err != nil {
 		t.Fatalf("NewInterceptor: %v", err)
 	}
+
+	underlying := newFakeClientConn()
+	underlying.header.Set("X-Sentinel", "untouched")
 	var called bool
 	next := connect.StreamingClientFunc(func(context.Context, connect.Spec) connect.StreamingClientConn {
 		called = true
-		return newFakeClientConn()
+		return underlying
 	})
-	interceptor.WrapStreamingClient(next)(context.Background(), connect.Spec{})
+
+	got := interceptor.WrapStreamingClient(next)(context.Background(), connect.Spec{})
 	if !called {
-		t.Error("the server interceptor swallowed an outbound stream")
+		t.Fatal("the server interceptor swallowed an outbound stream")
 	}
+	if got != connect.StreamingClientConn(underlying) {
+		t.Error("the server interceptor decorated an outbound stream; it must hand back the same connection")
+	}
+	if v := underlying.header.Get(authorizationHeader); v != "" {
+		t.Errorf("the server interceptor wrote %q to an outbound stream's Authorization header", v)
+	}
+	if v := underlying.header.Get("X-Sentinel"); v != "untouched" {
+		t.Errorf("the server interceptor rewrote an outbound stream's headers (sentinel is now %q)", v)
+	}
+	if len(store.arguments()) != 0 {
+		t.Error("the server interceptor consulted the token store for an OUTBOUND stream")
+	}
+}
+
+// TestTheServerInterceptorLeavesOutboundUnaryCallsAlone is the same property
+// for the unary path: the `IsClient` guard, which nothing else exercises.
+func TestTheServerInterceptorLeavesOutboundUnaryCallsAlone(t *testing.T) {
+	server, headers := captureAuthorization(t)
+	store := newRecordingStore()
+	interceptor, err := NewInterceptor("email", store)
+	if err != nil {
+		t.Fatalf("NewInterceptor: %v", err)
+	}
+
+	// The SERVER interceptor, installed on a client by mistake. It must be
+	// inert rather than refusing the caller's own outbound request.
+	client := hellov1connect.NewHelloServiceClient(server.Client(), server.URL,
+		connect.WithInterceptors(interceptor))
+	_, err = client.SayHello(context.Background(), connect.NewRequest(&hellov1.SayHelloRequest{Name: "sphyrix"}))
+	if connect.CodeOf(err) == connect.CodeUnauthenticated {
+		t.Error("the server interceptor authenticated an OUTBOUND unary call and refused it")
+	}
+	if got := headers(); len(got) != 1 {
+		t.Fatalf("the server saw %d requests, want 1", len(got))
+	} else if got[0] != "" {
+		t.Errorf("the server interceptor attached %q to an outbound request", got[0])
+	}
+	if len(store.arguments()) != 0 {
+		t.Error("the server interceptor consulted the token store for an OUTBOUND unary call")
+	}
+}
+
+// TestTheClientInterceptorLeavesInboundUnaryCallsAlone is the mirror: the
+// client half installed on a handler must not touch the inbound request.
+func TestTheClientInterceptorLeavesInboundUnaryCallsAlone(t *testing.T) {
+	minted, err := Mint("email")
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	// A handler wrapped in the CLIENT interceptor: it must run, and must not
+	// have had an Authorization header stamped on its inbound request.
+	mux := http.NewServeMux()
+	var seen string
+	mux.Handle(hellov1connect.NewHelloServiceHandler(
+		connectHandlerFunc(func(ctx context.Context, req *connect.Request[hellov1.SayHelloRequest]) (*connect.Response[hellov1.SayHelloResponse], error) {
+			seen = req.Header().Get(authorizationHeader)
+			return connect.NewResponse(&hellov1.SayHelloResponse{Message: "ok"}), nil
+		}),
+		connect.WithInterceptors(NewClientInterceptor(StaticToken(minted)))))
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	res, err := hellov1connect.NewHelloServiceClient(server.Client(), server.URL).
+		SayHello(context.Background(), connect.NewRequest(&hellov1.SayHelloRequest{Name: "sphyrix"}))
+	if err != nil {
+		t.Fatalf("the client interceptor refused an inbound unary call: %v", err)
+	}
+	if res.Msg.GetMessage() != "ok" {
+		t.Errorf("the handler answered %q", res.Msg.GetMessage())
+	}
+	if seen != "" {
+		t.Errorf("the client interceptor stamped %q on an INBOUND request", seen)
+	}
+}
+
+// connectHandlerFunc adapts a function to hellov1connect.HelloServiceHandler.
+type connectHandlerFunc func(context.Context, *connect.Request[hellov1.SayHelloRequest]) (*connect.Response[hellov1.SayHelloResponse], error)
+
+func (f connectHandlerFunc) SayHello(ctx context.Context, req *connect.Request[hellov1.SayHelloRequest]) (*connect.Response[hellov1.SayHelloResponse], error) {
+	return f(ctx, req)
 }
 
 // fakeClientConn is a connect.StreamingClientConn that records the request
@@ -246,10 +338,18 @@ func TestTheClientInterceptorLeavesInboundStreamsAlone(t *testing.T) {
 			ran = true
 			return nil
 		})
-	if err := wrapped(context.Background(), newFakeHandlerConn("/hello.v1.HelloService/SayHello")); err != nil {
+	conn := newFakeHandlerConn("/hello.v1.HelloService/SayHello")
+	conn.header.Set("X-Sentinel", "untouched")
+	if err := wrapped(context.Background(), conn); err != nil {
 		t.Fatalf("the client interceptor refused an inbound stream: %v", err)
 	}
 	if !ran {
 		t.Error("the client interceptor swallowed an inbound stream")
+	}
+	if v := conn.header.Get(authorizationHeader); v != "" {
+		t.Errorf("the client interceptor stamped %q on an INBOUND stream", v)
+	}
+	if v := conn.header.Get("X-Sentinel"); v != "untouched" {
+		t.Errorf("the client interceptor rewrote an inbound stream's headers (sentinel is now %q)", v)
 	}
 }
