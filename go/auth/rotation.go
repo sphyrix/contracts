@@ -78,6 +78,16 @@ const (
 	// rather than a claim in a comment. Off-platform pickup is a human
 	// rerunning the ADR 019 command and is not boundable here — which is why
 	// this is a floor and not the answer.
+	//
+	// REVISIT THIS IF ADR 027 DECISION 5's `refreshAfter` CHANGES. Two of the
+	// three inputs live outside this repo — `refreshAfter: 1m` is ADR 027
+	// Decision 5's, and kubelet's projection delay is an environment property
+	// nothing in this platform declares — so nothing mechanically connects
+	// them to this number. It is a documented estimate, not a derived fact.
+	// Deliberately unexported: ADR 027 Decision 5 is the authority for
+	// `refreshAfter`, and infrastructure asserting its VSO config against a
+	// constant in a public consumer-facing Go module would be a dependency in
+	// the wrong direction.
 	onPlatformPickupBound = 3 * time.Minute
 )
 

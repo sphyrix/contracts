@@ -1022,6 +1022,16 @@ func TestTheDefaultBumpIntervalIsAUsableInterval(t *testing.T) {
 		t.Errorf("onPlatformPickupBound (%s) is not above DefaultRefreshInterval (%s) — the pickup bound must cover the consumer's own re-read",
 			onPlatformPickupBound, DefaultRefreshInterval)
 	}
+
+	// And an ABSOLUTE floor under the floor. The check above only anchors the
+	// bound to DefaultRefreshInterval (5s), a 36x margin, so lowering the bound
+	// to 10s would pass it and quietly re-open the interval it is supposed to
+	// protect. VSO's `refreshAfter: 1m` (ADR 027 Decision 5) is a published
+	// number and the bound cannot be below one refresh cycle.
+	if onPlatformPickupBound < time.Minute {
+		t.Errorf("onPlatformPickupBound = %s, below ADR 027 Decision 5's refreshAfter of 1m — a consumer cannot pick a token up faster than VSO republishes it",
+			onPlatformPickupBound)
+	}
 }
 
 // DefaultCASAttempts is unpinned in the same way: every CAS test compares

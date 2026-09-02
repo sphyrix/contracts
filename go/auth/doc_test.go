@@ -72,8 +72,12 @@ func TestThePackageDocumentsItsObligations(t *testing.T) {
 			together: []string{"one bump mints", "does not revoke"},
 		},
 		{
+			// "takes two commits", not "two commits": the same paragraph cites
+			// the README heading "Revoking a token: two commits" verbatim, so
+			// the looser phrase is satisfied by the citation even after the
+			// sentence that makes the claim is deleted.
 			what:     "that revoking takes two commits",
-			together: []string{"two commits", "revoking"},
+			together: []string{"one bump mints", "takes two commits"},
 		},
 		{
 			what:     "that verification is against an accepted set of token_versions",

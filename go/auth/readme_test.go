@@ -26,7 +26,6 @@ import (
 // heading text, so an innocuous heading edit here silently breaks that link.
 func TestTheReadmeDocumentsTheTwoCommitRevocation(t *testing.T) {
 	readme := readReadme(t)
-	lower := strings.ToLower(readme)
 
 	// The anchor the infrastructure runbook links to is derived from this
 	// exact heading. Changing it is a cross-repo break, not a wording change.
@@ -50,10 +49,12 @@ func TestTheReadmeDocumentsTheTwoCommitRevocation(t *testing.T) {
 	}
 
 	// The thing the reader gets wrong, stated explicitly.
-	for _, phrase := range []string{"one bump mints", "does not revoke", "two commits"} {
-		if !strings.Contains(sectionLower, phrase) {
-			t.Errorf("the revocation section does not say %q — the single edit that mints rather than revokes is exactly the misreading this procedure exists to prevent", phrase)
-		}
+	// All three in ONE paragraph — the callout that makes the claim. Scoped,
+	// because the anchor note further down quotes the heading text "Revoking a
+	// token: two commits" verbatim, so a section-wide search for "two commits"
+	// passes even after the callout is deleted.
+	if !anyParagraphContainsAll(paragraphsOf(section), []string{"one bump mints", "does not revoke", "two commits"}) {
+		t.Error("no single paragraph of the revocation section says that one bump mints, does not revoke, and that revoking takes two commits — the single edit that mints rather than revokes is exactly the misreading this procedure exists to prevent")
 	}
 
 	// Both bumps have to be in the procedure, and so does the off-platform
@@ -90,10 +91,12 @@ func TestTheReadmeDocumentsTheTwoCommitRevocation(t *testing.T) {
 	// ACCEPTANCE: "The convention is described as platform-wide with
 	// `token_version` named as the single control, so a second sphyrix service
 	// copies it rather than inventing a `revoked` flag."
-	for _, phrase := range []string{"platform-wide", "single control", "token_version", "`revoked`"} {
-		if !strings.Contains(lower, strings.ToLower(phrase)) {
-			t.Errorf("the README does not say %q — a second sphyrix service reading it would not know this convention is the platform's one mechanism", phrase)
-		}
+	// Paragraph-scoped, like doc_test.go does for the package doc. A
+	// file-wide search passes even after the sentence that MAKES the claim is
+	// gutted, because "platform-wide" also occurs in the version-never-in-the-
+	// path rule further down — a different claim that does not carry AC 5.
+	if !anyParagraphContainsAll(paragraphsOf(readme), []string{"platform-wide", "single control", "token_version", "`revoked`"}) {
+		t.Error("no single paragraph of the README says token_version is the PLATFORM-WIDE single control and that a service must not invent a `revoked` flag — a second sphyrix service reading it would not know this convention is the platform's one mechanism")
 	}
 }
 
@@ -154,8 +157,12 @@ func TestTheReadmeQuotesTheDefaultsAccurately(t *testing.T) {
 // visible exit and no custodian who can lift it.
 func TestTheReadmeDocumentsSkipRecovery(t *testing.T) {
 	section := revocationSection(t, readReadme(t), "#### Revoking a token: two commits")
-	if !anyParagraphContainsAll(paragraphsOf(section), []string{"skip", "down"}) {
-		t.Error("the revocation procedure does not say that a skipped version is recovered by editing token_version back DOWN — a skip is refused until the declaration changes, and no custodian can lift it")
+	// "skip" and "down" alone are too weak: a reworded and WRONG recovery
+	// containing both words would pass. The recovery has to name the target
+	// (applied + 1) and the actionable form (revert), because an org cannot
+	// read the applied version out of the service to compute it.
+	if !anyParagraphContainsAll(paragraphsOf(section), []string{"skip", "revert", "applied + 1"}) {
+		t.Error("the revocation procedure does not give the skip recovery in actionable form — it must say to REVERT the mistaken edit and name applied + 1 as the target, since a skip is refused until the declaration changes, no custodian can lift it, and the org cannot read the applied version for itself")
 	}
 }
 

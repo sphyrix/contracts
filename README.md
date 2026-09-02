@@ -179,9 +179,15 @@ To retire a token that is live at version `N` (a leak, a compromise, an offboard
 
 **If you skip a version by mistake** — declaring `N+3` while `N+1` is applied — the bump is refused
 permanently, and no custodian can lift it: applying several at once would retire versions consumers
-may still hold. **Edit `token_version` back down** to one above the applied version and merge again.
-Lowering it below the applied version is refused too, so the only safe edit is down to
-`applied + 1`.
+may still hold. **Revert the mistaken edit.** The value you declared before the skip *is*
+`applied + 1`, whether the previous bump was applied or is still being held by the guardrail (a held
+bump does not move the applied version), so your own git history is the recovery. Lowering below the
+applied version is refused too, so `applied + 1` is the only safe target.
+
+You cannot read the applied version yourself — it is `orgs.token_version` in the service's database,
+and the refusal surfaces on `orgs.last_error` / `email_org_ready{org}`, both custodian-side. If your
+history is unclear, ask the custodian to **read** it out for you. That is a read, not an override:
+there is still no custodian-side way to bump or revoke on your behalf.
 
 Exposure is therefore bounded by how fast the two commits are made, not by an instant kill — the
 accepted trade for zero-downtime rotation through one control (ADR 020, Consequences). There is no
