@@ -7,9 +7,14 @@
 #   3. proto-gen      — regenerate the SDK
 #   4. gen-in-sync    — committed gen/ matches proto/ exactly
 #   5. go build       — the generated SDK actually compiles
-#   6. go test        — contract-level invariants (e.g. contractcheck/: no
-#                        vendor credential field, like a Postal token/API key,
-#                        is ever exposed on the descriptor set)
+#   6. lint           — golangci-lint (govet included) over the whole module,
+#                       hand-written go/auth as well as generated code
+#   7. go test        — contract-level invariants (contractcheck/: no vendor
+#                       credential field, like a Postal token/API key, is ever
+#                       exposed on the descriptor set) and go/auth's own suite
+#                       (ADR 027: hash-only lookup, UNAUTHENTICATED and
+#                       PERMISSION_DENIED mapping, crypto/rand minting,
+#                       TokenFromFile change detection)
 #
 # Every step runs a devtools target inside the devtools container, identical
 # to `just <target>` locally. No credentials: this repo is public, its own
@@ -66,5 +71,10 @@ jobs:
       - name: go build
         run: just build
 
+      - name: golangci-lint
+        run: just lint
+
+      # `just test` is `go test ./...`, so this covers contractcheck/ and
+      # go/auth alike. A new hand-written package needs no CI change.
       - name: go test
         run: just test
