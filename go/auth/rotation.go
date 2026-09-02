@@ -522,6 +522,11 @@ var ErrCASRefused = errors.New("auth: vault refused the check-and-set version")
 // ErrCASExhausted means the token path kept moving underneath the mint until
 // the attempt budget ran out. Nothing was written.
 //
+// It is NOT terminal for the org. ADR 027 Decision 3's model is that a failed
+// Vault write leaves nothing behind and the next resync retries, so the budget
+// is [DefaultCASAttempts] per resync with a report each time, not three tries
+// ever. Reading this error as "the org is stuck" is the misreading to avoid.
+//
 // Report it LOUDLY — `orgs.last_error` and `email_org_ready{org}`, the same
 // channel as a held bump. It means something else is writing an org's token
 // path repeatedly, which under ADR 027 Decision 5 is the tenant itself through

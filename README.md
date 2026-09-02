@@ -227,6 +227,10 @@ the write must carry `cas` = the secret's current version.
 > the **version, never the value**, so token values stay unreadable across orgs and the narrow
 > cross-tenant write path is otherwise unchanged. #488 records the same ruling as ADR 024
 > Amendment 4.
+>
+> Decision 3's *"never reads Vault back"* is qualified to **values** by the same ruling: the mint
+> reads `kv/metadata/...` for the version and never reads a token value back. The version is not
+> the secret — which is the line that made this amendment acceptable in the first place.
 
 The bump is therefore: **metadata read → write with `cas=<current version>`**, and on a refusal,
 re-read and try again, bounded. `auth.CASWriter` is that procedure:
@@ -246,7 +250,8 @@ once, since retrying an error whose cause is unknown is how a bounded loop becom
 A refused `cas` means the path moved between the read and the write. Under ADR 027 Decision 5 that
 is normally the **tenant itself**, which holds `tenant-rw` on its own path. After
 `auth.DefaultCASAttempts` (3) the mint gives up with `auth.ErrCASExhausted` and **nothing is
-written** — report that loudly, on the same channel as a held bump (`orgs.last_error`,
+written** — not terminal for the org, since ADR 027 Decision 3 has the next resync retry the whole
+mint, so the budget is three per resync rather than three ever — report that loudly, on the same channel as a held bump (`orgs.last_error`,
 `email_org_ready{org}`). It means something is rewriting an org's token path repeatedly, and a mint
 that gave up quietly would leave the org with no new token and nobody looking.
 
