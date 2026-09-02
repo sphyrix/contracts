@@ -34,6 +34,13 @@ type TokenStore interface {
 	//   - return [ErrTokenNotFound], wrapped or bare, for "no such token", and
 	//     return it for a hash that is malformed too — an unrecognisable key
 	//     is an unknown key, not a store failure.
+	//   - set BOTH [Identity.TokenVersion] (the version the found row was
+	//     minted at) and [Identity.AppliedTokenVersion] (the org's applied
+	//     `token_version`, design 001 §9.5's `orgs.token_version`) — one
+	//     `tokens`-to-`orgs` join, not a second round trip. [Interceptor]
+	//     checks the presented version against ADR 020's accepted set and
+	//     answers `INTERNAL` if either is missing, because a store that cannot
+	//     be version-checked must not be treated as one that accepts anything.
 	//   - never put the hash, and certainly never a token, into a returned
 	//     error. [Interceptor] logs store errors.
 	//   - be safe for concurrent use.

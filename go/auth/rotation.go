@@ -57,8 +57,8 @@ const (
 	//   - OFF-PLATFORM: a human rerunning the ADR 019 devtools command for
 	//     every off-platform consumer. Not boundable by any constant here.
 	//
-	// Fifteen minutes is an order of magnitude above the on-platform bound and
-	// short enough that an incident revocation is not obstructed for long. It
+	// Fifteen minutes is roughly five times the on-platform bound and short
+	// enough that an incident revocation is not obstructed for long. It
 	// does NOT cover the off-platform path — nothing can — which is why
 	// [BumpGuard] also requires evidence that the version being superseded has
 	// actually been used, and why "rerun the delivery command for every
@@ -103,10 +103,14 @@ var (
 // org that has never rotated and exactly [LiveVersions] long for every org
 // that has.
 //
-// A verifying service uses it twice: [Interceptor] refuses a token whose
-// version is not in it, and the service RETIRES on a bump by deleting every
-// `tokens` row for the org below this set's first element (design 001 §9.5).
-// Those are the same rule read from both ends, which is why they cannot drift.
+// A verifying service RETIRES on a bump by deleting every `tokens` row for the
+// org below this set's first element (design 001 §9.5). That is the same rule
+// [Interceptor] enforces per request through [VersionAccepted], read from the
+// other end — which is why the two cannot drift.
+//
+// The per-request path calls [VersionAccepted], not this function: verifying
+// one version is two comparisons and builds no slice. Use this one to compute
+// a retirement floor or to report the live set, not on the hot path.
 //
 // An applied version below [FirstTokenVersion] is not a version at all and
 // yields the empty set: nothing authenticates, which is the safe direction.
@@ -120,11 +124,20 @@ func AcceptedVersions(applied int32) []int32 {
 	// wraps to the smallest int32, which is still <= high, and it appends
 	// until the process dies. `token_version` is org-authored and the
 	// reconciler validates it as "an integer >= 1" with no upper bound, so the
-	// largest int32 is a value a tenant can declare in its own repo — that
-	// loop was a denial of service on the shared verifying service, reachable
-	// from a tenant commit. high-low is at most LiveVersions-1 by
-	// construction, so the count below cannot overflow.
+	// largest int32 is a value a tenant can declare in its own repo.
+	//
+	// The reachable path is RETIREMENT, not authentication: this function is
+	// called by [RetiredBy] (and hence [BumpGuard.CheckBump]) and directly by
+	// a service computing its retirement floor. The per-request path uses
+	// [VersionAccepted] and never reaches here.
+	//
+	// high-low is at most LiveVersions-1 by construction, so the count cannot
+	// overflow; the guard below makes the function total anyway, because a
+	// negative count would panic inside `make` on the auth path.
 	count := int(high) - int(low) + 1
+	if count <= 0 {
+		return nil
+	}
 	versions := make([]int32, count)
 	for i := range versions {
 		versions[i] = low + int32(i)
@@ -153,6 +166,10 @@ func VersionAccepted(tokenVersion, applied int32) bool {
 // revocation: moving from 1 to 2 retires nothing (the set grows from {1} to
 // {1, 2}), and only the FOLLOWING bump, 2 to 3, retires 1. A caller that wants
 // a token gone bumps twice and applies both.
+//
+// The result is meaningful only for declared >= applied. Going backwards is
+// not a retirement and this reports one — RetiredBy(3, 1) is {2, 3} — which is
+// harmless because [BumpGuard.CheckBump] refuses a lowering before it asks.
 func RetiredBy(applied, declared int32) []int32 {
 	var retired []int32
 	for _, version := range AcceptedVersions(applied) {
@@ -176,8 +193,15 @@ func acceptedRange(applied int32) (low, high int32, ok bool) {
 }
 
 // RotationState is one org's rotation state as [BumpGuard] needs to see it.
-// Every field is something a verifying service already stores (design 001
-// §9.5), so nothing new has to be recorded to run the guardrail.
+//
+// Applied and AppliedAt come straight out of design 001 §9.5:
+// `orgs.token_version` and the `created_at` of the `tokens` row minted for it.
+// AppliedLastUsedAt does NOT — §9.5 has no last-used column on either table,
+// and Story 11.2 (#433) does not add one. A service that does not track it
+// leaves it zero and sets [BumpGuard.Evidence] to [EvidenceOptional], which is
+// ADR 020's "a minimum interval, OR a check that the new version is in use".
+// Recording it is a deliberate choice with a cost — a write on the
+// authentication path — not an assumed column.
 type RotationState struct {
 	// Applied is the org's currently applied `token_version` —
 	// `orgs.token_version`. Not the declared one: while the guard is holding a
@@ -195,11 +219,49 @@ type RotationState struct {
 	// The zero time, or any time before AppliedAt, means no such request has
 	// been seen and there is no evidence at all.
 	//
-	// One consumer's cut-over is not proof that every consumer has cut over,
-	// which is exactly why this is required IN ADDITION to the interval rather
-	// than instead of it.
+	// It has no column in design 001 §9.5 (see the type's own doc). Leave it
+	// zero and use [EvidenceOptional] if the service does not record it.
+	//
+	// One consumer's cut-over is not proof that EVERY consumer has cut over,
+	// which is why it does not replace the interval under [EvidenceRequired].
 	AppliedLastUsedAt time.Time
 }
+
+// EvidencePolicy says whether [BumpGuard] additionally requires evidence that
+// the applied version is in use before it will allow a bump that retires
+// anything.
+//
+// ADR 020's Consequences call for "a minimum interval, OR a check that the new
+// version is in use". The interval is always enforced; this chooses whether
+// the second check is enforced alongside it. The zero value is the strict one.
+type EvidencePolicy int
+
+const (
+	// EvidenceRequired is the default: a bump that retires something needs
+	// both the elapsed interval AND a request seen at the applied version.
+	// Correct whenever the service records [RotationState.AppliedLastUsedAt].
+	EvidenceRequired EvidencePolicy = iota
+
+	// EvidenceOptional drops the evidence half and relies on the interval
+	// alone.
+	//
+	// This exists because evidence can be UNOBTAINABLE, and a guardrail that
+	// cannot be satisfied is not a guardrail — it is an outage of the only
+	// revocation path there is. The 2026-09-02 ruling gives sphyrix no
+	// custodian-side override, so an org's two commits are the whole
+	// mechanism, and requiring a request at the new version would block it
+	// forever when the consumer is offboarded (the very case a revocation is
+	// usually for), has not gone live yet, or sends monthly.
+	//
+	// Use it when the service does not track last use at all, or when the
+	// operator holds evidence this package cannot see — ADR 019's delivery run
+	// record is the inventory of which off-platform consumer holds which
+	// version, and it lives outside any database this guard can read.
+	//
+	// It does NOT relax the interval. There is still no way to spell "no
+	// interval".
+	EvidenceOptional
+)
 
 // BumpGuard is ADR 020's guardrail: the check that belongs in the tooling
 // rather than in an operator's head.
@@ -223,6 +285,12 @@ type BumpGuard struct {
 	// interval", because that is the failure this type exists to prevent.
 	MinInterval time.Duration
 
+	// Evidence chooses whether a request must have been seen at the applied
+	// version before a retiring bump is allowed. The zero value,
+	// [EvidenceRequired], is the strict one; see [EvidenceOptional] for when
+	// dropping it is correct rather than lax.
+	Evidence EvidencePolicy
+
 	// Now is the clock, for tests. Nil means [time.Now].
 	Now func() time.Time
 }
@@ -240,9 +308,11 @@ type BumpGuard struct {
 //     interval between them, which is precisely the thing being guarded
 //     against, so it is refused rather than collapsed into one.
 //   - Too soon. Less than [BumpGuard.MinInterval] has passed since
-//     state.AppliedAt.
+//     state.AppliedAt. Always enforced; there is no way to waive it.
 //   - Not in use. Nothing has authenticated at state.Applied, so there is no
-//     evidence any consumer has picked it up.
+//     evidence any consumer has picked it up. Enforced only under
+//     [EvidenceRequired] — see [EvidencePolicy], and read [EvidenceOptional]
+//     before assuming the strict setting is always the safe one.
 //
 // The last two apply only to a bump that actually RETIRES something. A bump
 // from [FirstTokenVersion] mints beside and retires nothing — the accepted set
@@ -250,6 +320,32 @@ type BumpGuard struct {
 // always legal, however recent the org's first token is. The guard fires
 // exactly when [RetiredBy] is non-empty, so the two can never disagree about
 // which bumps are dangerous.
+//
+// CheckBump is NOT consulted for an org's FIRST mint. There is no applied
+// version then, nothing can be retired, and an org that declares 3 on its very
+// first day gets 3 — ADR 027's amendment has the reconciler materialise 1 only
+// for orgs that have never rotated. Calling it with a zero Applied is a
+// caller's bug and answers [ErrInvalidRotationState], not a rotation refusal.
+//
+// A refusal is not an error the ORG ever sees: the bump is already merged in
+// the org's own repo (it is org-authored and self-service), so the service
+// declines to APPLY it and must surface that where an operator is looking —
+// `orgs.last_error` and `email_org_ready{org}` (design 001 §9.4, §9.5).
+// Silence here is dangerous in exactly the case that matters: an incident
+// responder merges the second commit, sees the repo say N+2, and believes the
+// compromised token is dead while the service is still at N+1 with N live.
+//
+// When the bump IS applied, advance `orgs.token_version` in the SAME
+// transaction as the insert of the new `tokens` row. Splitting them leaves a
+// window where a consumer that has already picked the new token up — VSO plus
+// [TokenFromFile] can be faster than the next resync — presents a version the
+// accepted set does not yet hold and gets `UNAUTHENTICATED`, which is the
+// window ADR 020 Decision 1 says never exists.
+//
+// Both version arguments are int32. `token_version` is validated upstream only
+// as "an integer >= 1" and Python integers are unbounded, so a declared value
+// that does not fit int32 is a SCHEMA error and must be rejected before it
+// reaches here — never truncated into range.
 //
 // No error returned here carries a token or a hash; they carry versions and
 // durations, which are not secrets.
@@ -299,7 +395,8 @@ func (g BumpGuard) CheckBump(state RotationState, declared int32) error {
 			state.Applied, elapsed.Round(time.Second), minInterval, declared, formatVersions(retired), state.Applied, ErrBumpTooSoon)
 	}
 
-	if state.AppliedLastUsedAt.IsZero() || state.AppliedLastUsedAt.Before(state.AppliedAt) {
+	if g.Evidence == EvidenceRequired &&
+		(state.AppliedLastUsedAt.IsZero() || state.AppliedLastUsedAt.Before(state.AppliedAt)) {
 		return fmt.Errorf("auth: no request has authenticated with token_version %d since it was applied, so nothing shows a consumer has cut over to it and bumping to %d would retire %s: %w",
 			state.Applied, declared, formatVersions(retired), ErrVersionNotInUse)
 	}

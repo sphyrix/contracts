@@ -100,6 +100,12 @@ interceptor, err := sphyrixauth.NewInterceptor("email", store) // store implemen
 mux.Handle(emailv1connect.NewEmailServiceHandler(svc, connect.WithInterceptors(interceptor)))
 ```
 
+`LookupTokenHash` must return **both** versions on the `Identity` it yields —
+`TokenVersion` (what the found row was minted at) and `AppliedTokenVersion` (the org's applied
+`token_version`). The interceptor checks the first against the accepted set derived from the
+second, and answers `INTERNAL` if either is missing: a store that cannot be version-checked must
+not be mistaken for one that accepts anything.
+
 An absent, malformed, wrong-prefix, foreign-service or unknown token is one answer —
 `UNAUTHENTICATED`, with nothing that tells a prober which it was. A handler that has an
 authenticated caller and is asked for another org's resource answers `PERMISSION_DENIED`;
@@ -147,9 +153,18 @@ To retire a token that is live at version `N` (a leak, a compromise, an offboard
    ([ADR 019](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/019-off-platform-m2m-token-delivery.md))
    — its run record is the only inventory of who holds what. Skipping this step is what step 4
    breaks.
-3. **Confirm `N+1` is actually in use** and that at least `auth.DefaultMinBumpInterval` (15 minutes)
-   has passed since step 1. `auth.BumpGuard.CheckBump` enforces both and refuses step 4 until they
-   hold, naming which one failed; it is not advisory, and there is no way to spell "no interval".
+3. **Wait out the interval, and confirm `N+1` is actually in use.** At least
+   `auth.DefaultMinBumpInterval` (15 minutes) must have passed since step 1.
+   `auth.BumpGuard.CheckBump` enforces that and refuses step 4 until it holds, naming which check
+   failed; there is no way to spell "no interval".
+
+   **When nobody will ever use `N+1`:** the evidence half is waivable — set
+   `BumpGuard.Evidence = auth.EvidenceOptional` and the interval alone gates step 4. That is ADR
+   020's *"a minimum interval, **or** a check that the new version is in use"*, and it is the right
+   setting when the consumer has been offboarded, has not gone live yet, or sends too infrequently
+   to authenticate inside any sane window — otherwise the guardrail would block the only revocation
+   path there is. Rely on the ADR 019 delivery run record for who actually holds what; it is
+   evidence `go/auth` cannot see.
 4. **Bump `token_version` from `N+1` to `N+2`** and merge. This mints `N+2` and **retires `N`** —
    the accepted set becomes `{N+1, N+2}`, and the compromised token stops authenticating. *This*
    commit is the revocation.
@@ -163,13 +178,23 @@ The guardrail in step 3 exists because bumping twice faster than consumers can p
 retires a version somebody is still using. It belongs in the tooling, not in an operator's head:
 
 ```go
-guard := sphyrixauth.BumpGuard{} // DefaultMinBumpInterval, real clock
+guard := sphyrixauth.BumpGuard{} // DefaultMinBumpInterval, real clock, evidence required
 err := guard.CheckBump(sphyrixauth.RotationState{
-    Applied:           applied,       // orgs.token_version
-    AppliedAt:         appliedAt,     // tokens.created_at for that version
-    AppliedLastUsedAt: lastUsedAt,    // evidence a consumer has cut over
-}, declared)                          // the org's newly declared token_version
+    Applied:           applied,    // orgs.token_version
+    AppliedAt:         appliedAt,  // tokens.created_at for that version
+    AppliedLastUsedAt: lastUsedAt, // see below — NOT a column design 001 §9.5 has
+}, declared)                       // the org's newly declared token_version
 ```
+
+`Applied` and `AppliedAt` come straight out of design 001 §9.5. **`AppliedLastUsedAt` does not** —
+there is no last-used column on `orgs` or `tokens`, and Story 11.2 does not add one. Recording it
+costs a write on the authentication path, so it is a deliberate choice: a service that does not
+track it leaves the field zero and sets `Evidence: auth.EvidenceOptional`.
+
+A refusal never reaches the org — the bump is already merged in the org's own repo — so the service
+must surface a held bump where an operator will see it (`orgs.last_error`, `email_org_ready{org}`).
+Otherwise an incident responder merges step 4, sees the repo say `N+2`, and believes the compromised
+token is dead while the service is still at `N+1` with `N` live.
 
 A refusal means **hold the whole bump** — mint nothing and retire nothing — and report the reason.
 Applying the mint while deferring the retirement would put three versions in flight and break the

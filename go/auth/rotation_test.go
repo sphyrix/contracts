@@ -3,7 +3,10 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -598,31 +601,57 @@ func TestFormatVersionsReadsAsProse(t *testing.T) {
 	}
 }
 
+// spinProbeEnv makes this test binary re-exec itself as the probe child.
+const spinProbeEnv = "SPHYRIX_AUTH_SPIN_PROBE"
+
 // The largest int32 must not spin. `token_version` is ORG-AUTHORED and the
 // reconciler validates it only as "an integer >= 1" — explicitly unbounded
-// above — so math.MaxInt32 is a value a tenant can put in its own repo, and it
-// reaches [AcceptedVersions] on every authenticated request through
-// [Identity.AppliedTokenVersion]. The obvious `for v := low; v <= high; v++`
-// never terminates there (the increment wraps to the smallest int32, which is
-// still <= high) and appends until the process is OOM-killed: a denial of
-// service on the shared verifying service, triggerable from a tenant commit.
+// above — so math.MaxInt32 is a value a tenant can put in its own repo. The
+// obvious `for v := low; v <= high; v++` never terminates there (the increment
+// wraps to the smallest int32, which is still <= high) and appends until the
+// process is OOM-killed.
 //
-// The short timeout is the assertion. A regression does not fail this test by
-// returning the wrong slice, it fails by never returning at all.
+// The REACHABLE path is retirement, not authentication: [AcceptedVersions] is
+// called by [RetiredBy] — and so by [BumpGuard.CheckBump] — and directly by a
+// service computing its retirement floor. The per-request path uses
+// [VersionAccepted], which builds no slice. An earlier version of this test
+// claimed the hot path and could not fail; it drives the real caller now.
+//
+// The probe runs in a SUBPROCESS under GOMEMLIMIT. A regression here does not
+// fail an assertion, it allocates about 1.8 GB/s toward a 16 GB target — in
+// this package's own history it OOM-killed the machine twice. Bounding the
+// child means a regression is a clean non-zero exit instead of an outage.
 func TestTheAcceptedSetTerminatesAtTheLargestVersion(t *testing.T) {
-	done := make(chan []int32, 1)
-	go func() { done <- AcceptedVersions(math.MaxInt32) }()
-
-	select {
-	case got := <-done:
-		want := []int32{math.MaxInt32 - 1, math.MaxInt32}
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("AcceptedVersions(MaxInt32) = %v, want %v", got, want)
+	if os.Getenv(spinProbeEnv) == "1" {
+		// Child. Reached only via the re-exec below.
+		got := AcceptedVersions(math.MaxInt32)
+		if len(got) != LiveVersions || got[0] != math.MaxInt32-1 || got[1] != math.MaxInt32 {
+			fmt.Fprintf(os.Stderr, "AcceptedVersions(MaxInt32) = %v\n", got)
+			os.Exit(3)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("AcceptedVersions(MaxInt32) did not return within 5s — the version loop is unbounded and will exhaust memory")
+		// And through the caller that actually reaches it.
+		if retired := RetiredBy(math.MaxInt32, math.MaxInt32); len(retired) != 0 {
+			fmt.Fprintf(os.Stderr, "RetiredBy(MaxInt32, MaxInt32) = %v\n", retired)
+			os.Exit(4)
+		}
+		os.Exit(0)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0],
+		"-test.run=^TestTheAcceptedSetTerminatesAtTheLargestVersion$", "-test.timeout=45s")
+	cmd.Env = append(os.Environ(), spinProbeEnv+"=1", "GOMEMLIMIT=64MiB", "GOGC=10")
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the bounded probe did not complete cleanly (%v) — the accepted-set loop is unbounded at math.MaxInt32.\nchild output:\n%s", err, output)
+	}
+}
+
+// The parent above proves the probe mechanism runs; this proves the values, in
+// process, where it is safe to do so because the fix makes the call O(1).
+func TestTheAcceptedSetIsCorrectAtTheLargestVersion(t *testing.T) {
 	if !VersionAccepted(math.MaxInt32, math.MaxInt32) || !VersionAccepted(math.MaxInt32-1, math.MaxInt32) {
 		t.Error("the two live versions are not accepted at the largest applied version")
 	}
@@ -631,33 +660,109 @@ func TestTheAcceptedSetTerminatesAtTheLargestVersion(t *testing.T) {
 	}
 }
 
-// The same boundary reached the way a request reaches it: through the store,
-// through the interceptor, on the hot path. This is the reachability half of
-// the test above — it fails by hanging if the bound is lost.
-func TestARequestAtTheLargestVersionDoesNotSpin(t *testing.T) {
+// A request presenting a token at the largest applied version authenticates.
+// This is NOT the spin guard — the request path never builds the set — it is
+// the end-to-end boundary check that the interceptor's comparison holds there.
+func TestARequestAtTheLargestVersionAuthenticates(t *testing.T) {
 	h := newHarness(t, &helloHandler{})
-	token := mustMint(t)
-	h.store.holdAt(token, "becoming-the-hunter", math.MaxInt32, math.MaxInt32)
+	current, previous, retired := mustMint(t), mustMint(t), mustMint(t)
+	h.store.holdAt(current, "becoming-the-hunter", math.MaxInt32, math.MaxInt32)
+	h.store.holdAt(previous, "becoming-the-hunter", math.MaxInt32-1, math.MaxInt32)
+	h.store.holdAt(retired, "becoming-the-hunter", math.MaxInt32-2, math.MaxInt32)
 
-	type result struct {
-		org string
-		err error
+	for name, token := range map[string]string{"the current version": current, "the previous version": previous} {
+		if org, err := h.call(t, bearer(token)); err != nil || org != "becoming-the-hunter" {
+			t.Errorf("%s at MaxInt32 gave (%q, %v), want the org and no error", name, org, err)
+		}
 	}
-	done := make(chan result, 1)
-	go func() {
-		org, err := h.call(t, bearer(token))
-		done <- result{org, err}
-	}()
+	if _, err := h.call(t, bearer(retired)); err == nil {
+		t.Error("a token two versions below MaxInt32 authenticated — it is retired")
+	}
+}
 
-	select {
-	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("a token at the largest version was refused: %v", got.err)
-		}
-		if got.org != "becoming-the-hunter" {
-			t.Errorf("authenticated as %q, want becoming-the-hunter", got.org)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("a request at the largest applied token_version never completed — the accepted-set loop is unbounded")
+// ACCEPTANCE (the guardrail's "or"): ADR 020's Consequences call for "a minimum
+// interval, OR a check that the new version is in use". [EvidenceRequired]
+// enforces both; [EvidenceOptional] drops the second and keeps the first.
+//
+// The waiver is not laxity, it is reachability. The 2026-09-02 ruling leaves
+// sphyrix no custodian-side override, so an org's two commits are the ONLY
+// revocation path — and requiring a request at the new version blocks it
+// forever when the consumer has been offboarded (the usual reason to revoke),
+// has not gone live, or sends monthly. A guardrail that cannot be satisfied is
+// an outage of the only revocation mechanism there is.
+func TestEvidenceOptionalDropsTheUseCheckButKeepsTheInterval(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	// Nothing has EVER authenticated at the applied version.
+	neverUsed := RotationState{Applied: 2, AppliedAt: now.Add(-24 * time.Hour)}
+
+	strict := BumpGuard{MinInterval: 15 * time.Minute, Now: clock}
+	if err := strict.CheckBump(neverUsed, 3); !errors.Is(err, ErrVersionNotInUse) {
+		t.Fatalf("the default guard gave %v, want ErrVersionNotInUse — EvidenceRequired must be the zero value", err)
+	}
+	if strict.Evidence != EvidenceRequired {
+		t.Error("the zero value of BumpGuard is not EvidenceRequired — the safe setting must be the default")
+	}
+
+	lenient := BumpGuard{MinInterval: 15 * time.Minute, Now: clock, Evidence: EvidenceOptional}
+	if err := lenient.CheckBump(neverUsed, 3); err != nil {
+		t.Fatalf("EvidenceOptional refused a bump a day after the last one with no use evidence: %v — revocation would be unreachable", err)
+	}
+
+	// The interval is NOT waived by the same switch. This is the assertion
+	// that keeps EvidenceOptional from quietly becoming "no guardrail".
+	tooSoon := RotationState{Applied: 2, AppliedAt: now.Add(-time.Minute)}
+	if err := lenient.CheckBump(tooSoon, 3); !errors.Is(err, ErrBumpTooSoon) {
+		t.Errorf("EvidenceOptional gave %v one minute after the last bump, want ErrBumpTooSoon — the interval is never waivable", err)
+	}
+
+	// And it does not turn off the other refusals either.
+	if err := lenient.CheckBump(RotationState{Applied: 3, AppliedAt: now.Add(-24 * time.Hour)}, 5); !errors.Is(err, ErrNotABump) {
+		t.Errorf("EvidenceOptional allowed a version skip: %v", err)
+	}
+}
+
+// The streaming path must refuse a retired version too. `authenticate` is
+// shared, but "the security control is structurally shared" is an argument, not
+// an assertion — a caller opening a stream with a revoked token is the case
+// that matters.
+func TestAStreamingCallerCannotOpenAStreamWithARetiredVersion(t *testing.T) {
+	store := newRecordingStore()
+	live, retired := mustMint(t), mustMint(t)
+	store.holdAt(live, "becoming-the-hunter", 3, 3)
+	store.holdAt(retired, "becoming-the-hunter", 1, 3)
+
+	interceptor, err := NewInterceptor("email", store)
+	if err != nil {
+		t.Fatalf("NewInterceptor: %v", err)
+	}
+	ran := false
+	wrapped := interceptor.WrapStreamingHandler(func(context.Context, connect.StreamingHandlerConn) error {
+		ran = true
+		return nil
+	})
+
+	open := func(token string) error {
+		ran = false
+		conn := newFakeHandlerConn(hellov1connect.HelloServiceSayHelloProcedure)
+		conn.header.Set("Authorization", "Bearer "+token)
+		return wrapped(context.Background(), conn)
+	}
+
+	if err := open(retired); err == nil {
+		t.Error("a retired version opened a stream")
+	} else if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
+		t.Errorf("a retired version gave %v, want %v", got, connect.CodeUnauthenticated)
+	}
+	if ran {
+		t.Error("the streaming handler ran behind a retired token")
+	}
+
+	if err := open(live); err != nil {
+		t.Fatalf("the live version was refused on the streaming path: %v", err)
+	}
+	if !ran {
+		t.Error("the streaming handler did not run for a live token")
 	}
 }

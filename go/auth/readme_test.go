@@ -3,6 +3,7 @@ package auth
 import (
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -42,7 +43,7 @@ func TestTheReadmeDocumentsTheTwoCommitRevocation(t *testing.T) {
 		t.Errorf("the revocation section has %d numbered steps, want at least 4 — a paragraph is not a procedure", len(steps))
 	}
 	for i, step := range steps {
-		if want := string(rune('1' + i)); step[1] != want {
+		if want := strconv.Itoa(i + 1); step[1] != want {
 			t.Errorf("step %d is numbered %q, want %q — the steps must read as a sequence", i+1, step[1], want)
 		}
 	}
@@ -62,6 +63,27 @@ func TestTheReadmeDocumentsTheTwoCommitRevocation(t *testing.T) {
 		if !strings.Contains(sectionLower, phrase) {
 			t.Errorf("the revocation section does not mention %q — an off-platform consumer that is never redelivered to is stranded by the second bump", phrase)
 		}
+	}
+
+	// The evidence half of the guardrail is WAIVABLE, and the procedure has to
+	// say so. ADR 020 asks for "a minimum interval, OR a check that the new
+	// version is in use"; without the waiver this very section contradicts
+	// itself, because it lists an offboarded consumer as a reason to revoke and
+	// an offboarded consumer never authenticates at the new version. The
+	// interval, by contrast, is never waivable — assert both halves, or the
+	// waiver could be widened into "no guardrail" without a test noticing.
+	// Scoped to ONE paragraph, not to the section: "waivable",
+	// "EvidenceOptional" and "offboarded" all occur elsewhere in this section
+	// for unrelated reasons, so a section-wide check passes even after the
+	// waiver paragraph is deleted outright. It has to be the same paragraph
+	// that says the waiver exists AND names the switch.
+	if !anyParagraphContainsAll(paragraphsOf(section), []string{"waivable", "evidenceoptional"}) {
+		t.Error("no single paragraph of the revocation section says the evidence check is waivable AND names EvidenceOptional — without it an operator whose consumer can never authenticate at the new version finds the only revocation path blocked with no way out, and this section still lists an offboarded consumer as a reason to revoke")
+	}
+	// The interval is the half that is NEVER waivable; if that sentence goes,
+	// the waiver above can be widened into "no guardrail" unnoticed.
+	if !strings.Contains(sectionLower, "no interval") {
+		t.Error("the revocation section no longer says there is no way to spell \"no interval\" — the interval must not become waivable alongside the evidence check")
 	}
 
 	// ACCEPTANCE: "The convention is described as platform-wide with
@@ -100,6 +122,19 @@ func TestTheReadmeCheckCanFail(t *testing.T) {
 	}
 }
 
+// paragraphsOf splits markdown into blank-line-separated paragraphs, so an
+// assertion that two phrases belong together cannot be satisfied by two
+// unrelated sentences that merely share a section.
+func paragraphsOf(section string) []string {
+	var paragraphs []string
+	for _, block := range strings.Split(section, "\n\n") {
+		if text := strings.Join(strings.Fields(block), " "); text != "" {
+			paragraphs = append(paragraphs, text)
+		}
+	}
+	return paragraphs
+}
+
 // revocationSection returns the README text from the given heading to the next
 // heading at the same level or above, so an assertion about "the procedure"
 // cannot be satisfied by a sentence somewhere else in the file.
@@ -113,7 +148,7 @@ func revocationSection(t *testing.T, readme, heading string) string {
 	rest := readme[start+len(heading):]
 
 	end := len(rest)
-	for _, line := range []string{"\n# ", "\n## ", "\n### ", "\n#### "} {
+	for _, line := range []string{"\n# ", "\n## ", "\n### ", "\n#### ", "\n##### "} {
 		if at := strings.Index(rest, line); at >= 0 && at < end {
 			end = at
 		}
