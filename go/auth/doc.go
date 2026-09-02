@@ -110,6 +110,13 @@
 // [Identity.TokenVersion] and [Identity.AppliedTokenVersion], because without
 // the applied version there is no set to check against.
 //
+// Writing the new token is a check-and-set: #488 arms the KV v2 mount, so a
+// mint reads the current version from `kv/metadata/+/platform/<service>/*`
+// (the version, never the value — the ADR 027 Decision 4 amendment of
+// 2026-09-02) and writes with that `cas`, retrying after a fresh read if the
+// path moved. [CASWriter] is that procedure and [TokenPathVersion] is the
+// version source.
+//
 // [BumpGuard] is ADR 020's guardrail. Two bumps closer together than consumers
 // can pick the new token up would retire a version somebody is still holding,
 // so the minimum interval and the evidence-of-use check belong in the tooling

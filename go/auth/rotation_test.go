@@ -796,3 +796,180 @@ func TestAStreamingCallerCannotOpenAStreamWithARetiredVersion(t *testing.T) {
 		t.Error("the streaming handler did not run for a live token")
 	}
 }
+
+// versionSource is a scripted [TokenPathVersion] that records every call, so a
+// test can assert the READ happened again on each retry rather than trusting
+// that it did.
+type versionSource struct {
+	versions []int // one per call; the last repeats once exhausted
+	err      error
+	calls    int
+}
+
+func (v *versionSource) CurrentVersion(context.Context, string) (int, error) {
+	v.calls++
+	if v.err != nil {
+		return 0, v.err
+	}
+	if len(v.versions) == 0 {
+		return 0, nil
+	}
+	if v.calls-1 < len(v.versions) {
+		return v.versions[v.calls-1], nil
+	}
+	return v.versions[len(v.versions)-1], nil
+}
+
+// The ruled happy path: one metadata read, one write, and the cas that reached
+// Vault is the version that was read.
+func TestCASWriterPassesTheVersionItRead(t *testing.T) {
+	source := &versionSource{versions: []int{7}}
+	var got []int
+	err := CASWriter{Version: source}.Write(context.Background(), "becoming-the-hunter",
+		func(_ context.Context, cas int) error {
+			got = append(got, cas)
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if want := []int{7}; !reflect.DeepEqual(got, want) {
+		t.Errorf("the write saw cas %v, want %v", got, want)
+	}
+	if source.calls != 1 {
+		t.Errorf("the version was read %d times, want 1 — a successful write must not re-read", source.calls)
+	}
+}
+
+// A refused cas is retried AFTER A FRESH READ. Retrying with the same cas
+// cannot succeed — the version is exactly what was wrong — so this asserts the
+// second attempt carried the second version, not the first one again.
+func TestCASWriterRereadsTheVersionOnARefusal(t *testing.T) {
+	source := &versionSource{versions: []int{7, 9}}
+	var seen []int
+	err := CASWriter{Version: source}.Write(context.Background(), "becoming-the-hunter",
+		func(_ context.Context, cas int) error {
+			seen = append(seen, cas)
+			if len(seen) == 1 {
+				return fmt.Errorf("vault said no: %w", ErrCASRefused)
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if want := []int{7, 9}; !reflect.DeepEqual(seen, want) {
+		t.Errorf("the write saw cas %v, want %v — the retry must carry a freshly read version", seen, want)
+	}
+	if source.calls != 2 {
+		t.Errorf("the version was read %d times, want 2 — a retry without a re-read is an infinite loop with extra steps", source.calls)
+	}
+}
+
+// The budget is bounded and nothing is written when it runs out. The error is
+// the loud one, so the caller can surface it.
+func TestCASWriterGivesUpLoudlyAfterABoundedNumberOfAttempts(t *testing.T) {
+	source := &versionSource{versions: []int{1, 2, 3, 4, 5, 6, 7, 8}}
+	writes := 0
+	err := CASWriter{Version: source, Attempts: 3}.Write(context.Background(), "becoming-the-hunter",
+		func(context.Context, int) error {
+			writes++
+			return ErrCASRefused
+		})
+	if !errors.Is(err, ErrCASExhausted) {
+		t.Fatalf("Write gave %v, want ErrCASExhausted", err)
+	}
+	if writes != 3 || source.calls != 3 {
+		t.Errorf("%d writes and %d reads, want 3 and 3 — the loop must be bounded by Attempts", writes, source.calls)
+	}
+	if !strings.Contains(err.Error(), "becoming-the-hunter") || !strings.Contains(err.Error(), "3 attempts") {
+		t.Errorf("the exhaustion error %q does not name the org and the budget", err)
+	}
+}
+
+// Zero and negative Attempts mean the default, never "unbounded".
+func TestCASWriterAttemptsCannotBeUnbounded(t *testing.T) {
+	for name, attempts := range map[string]int{"zero": 0, "negative": -5} {
+		source := &versionSource{versions: []int{1}}
+		writes := 0
+		err := CASWriter{Version: source, Attempts: attempts}.Write(context.Background(), "org",
+			func(context.Context, int) error {
+				writes++
+				return ErrCASRefused
+			})
+		if !errors.Is(err, ErrCASExhausted) {
+			t.Errorf("%s: got %v, want ErrCASExhausted", name, err)
+		}
+		if writes != DefaultCASAttempts {
+			t.Errorf("%s: %d attempts, want DefaultCASAttempts (%d)", name, writes, DefaultCASAttempts)
+		}
+	}
+}
+
+// Only a refused cas is retried. Any other write error fails the mint at once —
+// retrying an error whose cause is unknown is how a bounded loop becomes an
+// unbounded one, and a permission error retried three times is three audit-log
+// denials instead of one.
+func TestCASWriterDoesNotRetryANonCASError(t *testing.T) {
+	source := &versionSource{versions: []int{1}}
+	sentinel := errors.New("vault is sealed")
+	writes := 0
+	err := CASWriter{Version: source}.Write(context.Background(), "org",
+		func(context.Context, int) error {
+			writes++
+			return sentinel
+		})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Write gave %v, want the write's own error unchanged", err)
+	}
+	if errors.Is(err, ErrCASExhausted) {
+		t.Error("a non-cas failure was reported as cas exhaustion")
+	}
+	if writes != 1 {
+		t.Errorf("the write ran %d times, want 1 — only a refused cas is retried", writes)
+	}
+}
+
+// A version source that cannot answer fails the mint, and nothing is written.
+// Guessing a cas would be the silent fallback this contract exists to prevent.
+func TestCASWriterFailsTheMintWhenTheVersionIsUnknown(t *testing.T) {
+	source := &versionSource{err: errors.New("metadata read denied")}
+	writes := 0
+	err := CASWriter{Version: source}.Write(context.Background(), "org",
+		func(context.Context, int) error { writes++; return nil })
+	if err == nil {
+		t.Fatal("Write succeeded with no version — it must never guess a cas")
+	}
+	if writes != 0 {
+		t.Errorf("the write ran %d times with an unknown version, want 0", writes)
+	}
+	if !strings.Contains(err.Error(), "metadata read denied") {
+		t.Errorf("the error %q loses the cause", err)
+	}
+}
+
+// A cancelled context stops the loop instead of spending the whole budget.
+func TestCASWriterStopsOnACancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	source := &versionSource{versions: []int{1}}
+	writes := 0
+	err := CASWriter{Version: source}.Write(ctx, "org",
+		func(context.Context, int) error { writes++; return ErrCASRefused })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Write gave %v, want context.Canceled", err)
+	}
+	if writes != 0 || source.calls != 0 {
+		t.Errorf("%d writes and %d reads on a cancelled context, want 0 and 0", writes, source.calls)
+	}
+}
+
+// A misconfigured writer is refused rather than silently doing nothing.
+func TestCASWriterRequiresItsCollaborators(t *testing.T) {
+	if err := (CASWriter{}).Write(context.Background(), "org", func(context.Context, int) error { return nil }); err == nil {
+		t.Error("a CASWriter with no version source was accepted")
+	}
+	if err := (CASWriter{Version: &versionSource{}}).Write(context.Background(), "org", nil); err == nil {
+		t.Error("a CASWriter with no write function was accepted")
+	}
+}

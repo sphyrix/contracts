@@ -96,6 +96,35 @@ func TestTheReadmeDocumentsTheTwoCommitRevocation(t *testing.T) {
 	}
 }
 
+// The ADR 027 Decision 4 AMENDMENT is a deliverable of this story, not
+// commentary: the 2026-09-02 ruling widened a grant list that Decision 4 stated
+// as a closed set ("no read, delete or kv/metadata grant"), and #488 records the
+// same ruling on ADR 024. If this repo's copy of it disappears, the next reader
+// of the contract sees a write path that cannot supply the cas it is required
+// to send, and the grant looks unexplained wherever it is found in Terraform.
+//
+// The version-not-value half is the security property that made the amendment
+// acceptable at all, so it is asserted in the same paragraph as the grant.
+func TestTheReadmeRecordsTheADR027Decision4Amendment(t *testing.T) {
+	readme := readReadme(t)
+
+	if !anyParagraphContainsAll(paragraphsOf(readme), []string{"decision 4", "amendment", "kv/metadata"}) {
+		t.Error("no single paragraph records the metadata-read grant as an ADR 027 Decision 4 amendment — the grant would look unexplained to whoever finds it in Terraform")
+	}
+	if !anyParagraphContainsAll(paragraphsOf(readme), []string{"kv/metadata", "version", "never the value"}) {
+		t.Error("the README does not say the metadata grant yields the version and NEVER the value — that is the property that keeps token values unreadable across orgs")
+	}
+
+	// The procedure itself: read, then write with that cas, then re-read on a
+	// refusal. A retry that does not re-read cannot succeed.
+	lower := strings.ToLower(readme)
+	for _, phrase := range []string{"caswriter", "errcasexhausted", "re-read"} {
+		if !strings.Contains(lower, phrase) {
+			t.Errorf("the README does not mention %q — the bounded read/write/retry procedure is the ruled one and #434 implements against it", phrase)
+		}
+	}
+}
+
 // TestTheReadmeCheckCanFail proves the matchers above are not vacuous: run over
 // a README that says none of it, every one of them must miss.
 func TestTheReadmeCheckCanFail(t *testing.T) {

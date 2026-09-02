@@ -462,23 +462,24 @@ func formatVersions(versions []int32) string {
 // It exists because #488 arms the KV v2 mount with `cas_required=true`, and
 // ADR 020's mint-beside is an OVERWRITE of
 // `kv/data/<org>/platform/<service>/token`. A KV v2 write on an armed mount
-// must carry `cas` equal to the secret's current version, and ADR 027 Decision
-// 4 gives the verifying service `create`/`update` on
-// `kv/data/+/platform/<service>/*` with — verbatim — "no `read`, `delete` or
-// `kv/metadata` grant". The writer therefore cannot learn the number it is
-// required to send. Where that number comes from is an open ruling, so it is a
-// PLUGGABLE INPUT here rather than a decision this package makes:
+// must carry `cas` equal to the secret's current version.
 //
-//   - a metadata read (`kv/metadata/+/platform/<service>/*`, version but never
-//     value) — an amendment to Decision 4's grant list, and it has to be
-//     recorded on ADR 027 as one;
-//   - the service tracking the version itself from its own hash rows;
-//   - one KV path per token version, where every write is a create and the
-//     answer is always 0.
+// # ADR 027 Decision 4 amendment (human ruling, 2026-09-02)
 //
-// One method covers all three, which is the point: the ruling becomes a choice
-// of implementation and neither this contract nor Story 11.3 (#434) is
-// redesigned around it.
+// Decision 4 originally granted the verifying service `create`/`update` on
+// `kv/data/+/platform/<service>/*` with "no `read`, `delete` or `kv/metadata`
+// grant" — which left the writer unable to learn the number it is required to
+// send. AMENDED: the service also gets `read` on
+// `kv/metadata/+/platform/<service>/*` — and ONLY there. That path yields the
+// VERSION, never the value, so token values remain unreadable across orgs and
+// the narrow cross-tenant write path is unchanged in every other respect.
+// (#488 records the same ruling as ADR 024 Amendment 4.)
+//
+// The shipped implementation is therefore a METADATA READ. The interface stays
+// pluggable because the seam is worth keeping — a service that tracks the
+// version itself, or a future one-path-per-version layout, satisfies the same
+// contract — but the ruled and supported source is the metadata read, and a
+// service that invents another one is off the platform convention.
 //
 // This package has no Vault client and must never acquire one — the interface
 // is deliberately expressed in ctx, an org and an int.
@@ -493,4 +494,96 @@ type TokenPathVersion interface {
 	// Decision 3's Vault-first ordering already provides for. Sending no `cas`
 	// at all is refused outright by an armed mount.
 	CurrentVersion(ctx context.Context, org string) (int, error)
+}
+
+// DefaultCASAttempts is how many times [CASWriter] will read the version and
+// try the write before giving up. Three: the conflict this retries is a tenant
+// overwriting its own token path (ADR 027 Decision 5 gives the tenant
+// `tenant-rw` there), which is rare and not adversarial. A loop that retried
+// indefinitely would hide a path being rewritten continuously instead of
+// reporting it.
+const DefaultCASAttempts = 3
+
+// ErrCASRefused is what a write function returns to say Vault rejected the
+// check-and-set version — the secret moved between the metadata read and the
+// write. It is the ONLY error [CASWriter] retries; anything else fails the
+// mint immediately, because retrying an error whose cause is unknown is how a
+// bounded loop becomes an unbounded one.
+var ErrCASRefused = errors.New("auth: vault refused the check-and-set version")
+
+// ErrCASExhausted means the token path kept moving underneath the mint until
+// the attempt budget ran out. Nothing was written.
+//
+// Report it LOUDLY — `orgs.last_error` and `email_org_ready{org}`, the same
+// channel as a held bump. It means something else is writing an org's token
+// path repeatedly, which under ADR 027 Decision 5 is the tenant itself through
+// `tenant-rw`, and a mint that silently gave up would leave the org with no
+// new token and nobody looking.
+var ErrCASExhausted = errors.New("auth: the token path kept moving under the mint")
+
+// CASWriter is the ruled bump procedure: read the current version, write with
+// that `cas`, and on a refusal re-read and try again, bounded.
+//
+// The re-read is the point. Retrying with the SAME cas cannot succeed — the
+// version is exactly what was wrong — so a retry that does not read again is
+// an infinite loop with extra steps.
+type CASWriter struct {
+	// Version is where the `cas` comes from: the metadata read, per the
+	// 2026-09-02 ruling. Required.
+	Version TokenPathVersion
+
+	// Attempts bounds the read-write cycles. Zero or negative means
+	// [DefaultCASAttempts]; there is no way to spell "unbounded".
+	Attempts int
+}
+
+// Write performs one mint-beside write under check-and-set.
+//
+// write is handed the `cas` to present and must return [ErrCASRefused], wrapped
+// or bare, when Vault rejects it. It must not log the token it is writing — the
+// obligations in this package's documentation apply inside that closure like
+// everywhere else.
+//
+// Errors: the version source's error (the mint fails; nothing is written), the
+// write's own non-cas error unchanged, or [ErrCASExhausted]. On success the
+// caller stores the hash SECOND, per ADR 027 Decision 3.
+func (w CASWriter) Write(ctx context.Context, org string, write func(ctx context.Context, cas int) error) error {
+	if w.Version == nil {
+		return errors.New("auth: a TokenPathVersion is required")
+	}
+	if write == nil {
+		return errors.New("auth: a write function is required")
+	}
+
+	attempts := w.Attempts
+	if attempts <= 0 {
+		attempts = DefaultCASAttempts
+	}
+
+	var refused error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		// Checked every time round, so a cancelled context stops the loop
+		// rather than spending the whole budget on a dead request.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("auth: writing the token for %q: %w", org, err)
+		}
+
+		// A FRESH read each attempt: the previous cas is known-stale.
+		cas, err := w.Version.CurrentVersion(ctx, org)
+		if err != nil {
+			return fmt.Errorf("auth: reading the token path version for %q: %w", org, err)
+		}
+
+		switch err := write(ctx, cas); {
+		case err == nil:
+			return nil
+		case errors.Is(err, ErrCASRefused):
+			refused = err
+		default:
+			return err
+		}
+	}
+
+	return fmt.Errorf("auth: %d attempts to write the token for %q were all refused (last: %v): %w",
+		attempts, org, refused, ErrCASExhausted)
 }
