@@ -65,7 +65,7 @@
 //	client := emailv1connect.NewEmailServiceClient(http.DefaultClient,
 //	    "https://email.dev.sphyrix.cloud",
 //	    connect.WithInterceptors(auth.NewClientInterceptor(
-//	        auth.TokenFromFile("/var/run/sphyrix/becoming-the-hunter/platform/email/token"))))
+//	        auth.TokenFromFile("/var/run/sphyrix/org/becoming-the-hunter/_platform/email/token"))))
 //
 // [TokenFromFile] RE-READS the mounted file on change, within a bounded
 // interval. This is not an optimisation to skip: the token is re-minted on
@@ -117,7 +117,7 @@
 // call itself belongs to the service.
 //
 // Writing the new token is a check-and-set: #488 arms the KV v2 mount, so a
-// mint reads the current version from `kv/metadata/+/platform/<service>/*`
+// mint reads the current version from `kv/metadata/org/+/_platform/<service>/*`
 // (the version, never the value — the ADR 027 Decision 4 amendment of
 // 2026-09-02) and writes with that `cas`, retrying after a fresh read if the
 // path moved. [CASWriter] is that procedure and [TokenPathVersion] is the

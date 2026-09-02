@@ -487,16 +487,16 @@ func formatVersions(versions []int32) string {
 //
 // It exists because #488 arms the KV v2 mount with `cas_required=true`, and
 // ADR 020's mint-beside is an OVERWRITE of
-// `kv/data/<org>/platform/<service>/token`. A KV v2 write on an armed mount
+// `kv/data/org/<org>/_platform/<service>/token`. A KV v2 write on an armed mount
 // must carry `cas` equal to the secret's current version.
 //
 // # ADR 027 Decision 4 amendment (human ruling, 2026-09-02)
 //
 // Decision 4 originally granted the verifying service `create`/`update` on
-// `kv/data/+/platform/<service>/*` with "no `read`, `delete` or `kv/metadata`
+// `kv/data/org/+/_platform/<service>/*` with "no `read`, `delete` or `kv/metadata`
 // grant" — which left the writer unable to learn the number it is required to
 // send. AMENDED: the service also gets `read` on
-// `kv/metadata/+/platform/<service>/*` — and ONLY there. That path yields the
+// `kv/metadata/org/+/_platform/<service>/*` — and ONLY there. That path yields the
 // VERSION, never the value, so token values remain unreadable across orgs and
 // the narrow cross-tenant write path is unchanged in every other respect.
 // (#488 records the same ruling as ADR 024 Amendment 4.)

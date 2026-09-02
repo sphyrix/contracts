@@ -83,7 +83,7 @@ Three rules bind everyone who touches one:
 client := emailv1connect.NewEmailServiceClient(http.DefaultClient,
     "https://email.dev.sphyrix.cloud",
     connect.WithInterceptors(sphyrixauth.NewClientInterceptor(
-        sphyrixauth.TokenFromFile("/var/run/sphyrix/becoming-the-hunter/platform/email/token"))))
+        sphyrixauth.TokenFromFile("/var/run/sphyrix/org/becoming-the-hunter/_platform/email/token"))))
 ```
 
 `TokenFromFile` **re-reads the mounted file on change**, within `DefaultRefreshInterval`. That is
@@ -229,13 +229,13 @@ at-most-two invariant.
 #### Writing the new token to Vault (`cas`)
 
 [#488](https://github.com/sphyrix/infrastructure/issues/488) arms the KV v2 mount with
-`cas_required=true`, and mint-beside **overwrites** `kv/data/<org>/platform/<service>/token` — so
+`cas_required=true`, and mint-beside **overwrites** `kv/data/org/<org>/_platform/<service>/token` — so
 the write must carry `cas` = the secret's current version.
 
 > **ADR 027 Decision 4 amendment (human ruling, 2026-09-02).** Decision 4 originally granted the
-> verifying service `create`/`update` on `kv/data/+/platform/<service>/*` with *"no `read`, `delete`
+> verifying service `create`/`update` on `kv/data/org/+/_platform/<service>/*` with *"no `read`, `delete`
 > or `kv/metadata` grant"*, which left it unable to learn the number it is required to send. It now
-> also gets **`read` on `kv/metadata/+/platform/<service>/*`, and only there** — that path yields
+> also gets **`read` on `kv/metadata/org/+/_platform/<service>/*`, and only there** — that path yields
 > the **version, never the value**, so token values stay unreadable across orgs and the narrow
 > cross-tenant write path is otherwise unchanged. #488 records the same ruling as ADR 024
 > Amendment 4.
@@ -250,7 +250,7 @@ re-read and try again, bounded. `auth.CASWriter` is that procedure:
 ```go
 err := sphyrixauth.CASWriter{Version: metadataReader}.Write(ctx, org,
     func(ctx context.Context, cas int) error {
-        // write kv/data/<org>/platform/<service>/token with this cas;
+        // write kv/data/org/<org>/_platform/<service>/token with this cas;
         // return auth.ErrCASRefused when Vault rejects it
     })
 ```

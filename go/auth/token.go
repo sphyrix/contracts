@@ -30,11 +30,11 @@ const (
 	// maxServiceLen bounds the `<service>` segment, which is DNS-label shaped.
 	//
 	// The segment is the service's PLATFORM name — the `<service>` of
-	// `kv/data/<org>/platform/<service>/token` and of the mount
-	// `/var/run/sphyrix/<org>/platform/<service>/` (ADR 027 Decisions 4 and 5).
+	// `kv/data/org/<org>/_platform/<service>/token` and of the mount
+	// `/var/run/sphyrix/org/<org>/_platform/<service>/` (ADR 027 Decisions 4 and 5).
 	// For the first consumer that is `email`, not the repository or workload
 	// name `email-service`: a token minted as `sphx_email-service_…` would not
-	// match the `platform/email/` path its own delivery is rendered for.
+	// match the `_platform/email/` path its own delivery is rendered for.
 	maxServiceLen = 63
 
 	// separator ends the `<service>` segment. Service names may not contain

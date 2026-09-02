@@ -102,7 +102,7 @@ func withClock(now func() time.Time) FileOption {
 
 // TokenFromFile returns a [TokenSource] reading path — for an on-platform
 // consumer, the mount ADR 027 Decision 5 renders:
-// `/var/run/sphyrix/<org>/platform/<service>/token`.
+// `/var/run/sphyrix/org/<org>/_platform/<service>/token`.
 //
 // Nothing is read until the first [FileTokenSource.Token] call, so this cannot
 // fail and a client may be constructed before its token has been projected.
@@ -188,7 +188,7 @@ var _ connect.Interceptor = (*ClientInterceptor)(nil)
 //	client := emailv1connect.NewEmailServiceClient(http.DefaultClient,
 //	    "https://email.dev.sphyrix.cloud",
 //	    connect.WithInterceptors(auth.NewClientInterceptor(
-//	        auth.TokenFromFile("/var/run/sphyrix/becoming-the-hunter/platform/email/token"))))
+//	        auth.TokenFromFile("/var/run/sphyrix/org/becoming-the-hunter/_platform/email/token"))))
 //
 // It panics on a nil source: a client with nothing to authenticate with is a
 // wiring mistake, and it is better found at start-up than as an
