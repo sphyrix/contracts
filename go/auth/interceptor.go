@@ -227,6 +227,34 @@ func (i *Interceptor) authenticate(ctx context.Context, procedure string, header
 		return nil, errInternal()
 	}
 
+	// ADR 020's ACCEPTED SET, checked here and not only in the store. A store
+	// retires a version by deleting its rows, so in the steady state a revoked
+	// token simply is not found — but a delete that failed, a replica that has
+	// not caught up or a store that indexes by hash alone would each leave a
+	// retired row answering lookups, and every one of those turns a revocation
+	// into a no-op. Refusing the version here means revocation holds even when
+	// retirement has not run.
+	if identity.TokenVersion < FirstTokenVersion || identity.AppliedTokenVersion < FirstTokenVersion {
+		// The store answered, and answered with something that is not a
+		// version. Ours, like the empty org above: refusing as UNAUTHENTICATED
+		// would tell a caller its token is bad when the fault is here.
+		i.logger.ErrorContext(ctx, "the token store returned a token_version below the first version",
+			"procedure", procedure,
+			"token_version", identity.TokenVersion,
+			"applied_token_version", identity.AppliedTokenVersion)
+		return nil, errInternal()
+	}
+	if !VersionAccepted(identity.TokenVersion, identity.AppliedTokenVersion) {
+		// Retired (or from a version never applied). One answer, like every
+		// other failed authentication — a prober learns nothing about which.
+		// Versions are not secrets, so the log may name them.
+		i.logger.DebugContext(ctx, "the token's token_version is no longer accepted",
+			"procedure", procedure,
+			"token_version", identity.TokenVersion,
+			"applied_token_version", identity.AppliedTokenVersion)
+		return nil, errUnauthenticated()
+	}
+
 	return NewContext(ctx, identity), nil
 }
 

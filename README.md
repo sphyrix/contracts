@@ -34,7 +34,7 @@ Alongside the generated stubs the module ships one hand-written package:
 
 | Package | Contents | Go import path |
 |---|---|---|
-| `auth` | The platform's shared machine-to-machine bearer middleware (ADR 027): server interceptor, client interceptor, `TokenFromFile`, and the token format itself. It lives here rather than in a library of its own because every sphyrix service and every caller needs it *with* the stubs. | `go/auth` |
+| `auth` | The platform's shared machine-to-machine bearer middleware (ADR 027): server interceptor, client interceptor, `TokenFromFile`, the token format itself, and `token_version` rotation/revocation (ADR 020) — the accepted-set verifier and the bump guardrail. It lives here rather than in a library of its own because every sphyrix service and every caller needs it *with* the stubs. | `go/auth` |
 
 ## Consuming (Go)
 
@@ -107,10 +107,79 @@ authenticated caller and is asked for another org's resource answers `PERMISSION
 **resource**, never from the request. `auth.FromContext` reads the org the interceptor
 established.
 
-Rotation and revocation are not in v1 by decision (design 001 D-19). `auth.Identity.TokenVersion`
-carries ADR 027's `token_version` — constant `1` — so
-[ADR 020](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/020-m2m-token-rotation-and-revocation.md)
-can add them without changing this package's exported surface.
+### Rotating and revoking a token
+
+Rotation and revocation both ride on **one control**, and that control is `token_version`
+([ADR 020](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/020-m2m-token-rotation-and-revocation.md)).
+It is **platform-wide**: `token_version` is the single control for **every** platform M2M token of
+this class ([ADR 027](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/027-platform-m2m-token-convention.md)),
+so a second sphyrix service copies this convention rather than inventing a `revoked` flag, an
+expiry, or any other second source of truth about whether a token is live. ADR 020 considered and
+rejected a `revoked = true` field for exactly that reason: a second control saying what a second
+bump already says is a second thing to keep consistent.
+
+The version is **org-authored** — `[email].token_version` in the org's own tenant platform repo, an
+optional integer ≥ 1 defaulting to `1`. Rotation is self-service: an org rotates on its own
+schedule, with no custodian PR. (`1` is a *baseline*, not a constant — an org that has rotated is
+at `2` or more.)
+
+Raising it **mints the new token beside the current one**, and both authenticate. The verifier
+therefore checks an **accepted set** — `auth.AcceptedVersions` / `auth.VersionAccepted`, enforced by
+the interceptor on every request — which holds at most `auth.LiveVersions` (2) versions: `N` and
+`N-1`. `N-2` is refused. So there is never a window in which a consumer holds no valid token, and
+the consumer cuts over on its own schedule via whichever delivery path it has.
+
+#### Revoking a token: two commits
+
+> **One bump mints; it does not revoke.** Raising `token_version` by one adds the new version
+> *beside* the old one — the old token keeps working. The intuitive single edit is a **rotation**,
+> not a revocation, and reaching for it in an incident leaves the compromised token live. Revoking
+> takes **two commits**.
+
+To retire a token that is live at version `N` (a leak, a compromise, an offboarded consumer):
+
+1. **Bump `[email].token_version` from `N` to `N+1`** in the org's tenant platform repo, and merge.
+   The service mints version `N+1` **beside** `N`. Both authenticate. **Nothing is revoked yet** —
+   the accepted set is now `{N, N+1}`.
+2. **Deliver `N+1` to every consumer.** On-platform consumers need no action: VSO refreshes the
+   mounted `VaultStaticSecret` (`refreshAfter: 1m`) and `auth.TokenFromFile` re-reads it. For every
+   **off-platform** consumer, rerun the devtools delivery command
+   ([ADR 019](https://github.com/sphyrix/infrastructure/blob/main/docs/adr/019-off-platform-m2m-token-delivery.md))
+   — its run record is the only inventory of who holds what. Skipping this step is what step 4
+   breaks.
+3. **Confirm `N+1` is actually in use** and that at least `auth.DefaultMinBumpInterval` (15 minutes)
+   has passed since step 1. `auth.BumpGuard.CheckBump` enforces both and refuses step 4 until they
+   hold, naming which one failed; it is not advisory, and there is no way to spell "no interval".
+4. **Bump `token_version` from `N+1` to `N+2`** and merge. This mints `N+2` and **retires `N`** —
+   the accepted set becomes `{N+1, N+2}`, and the compromised token stops authenticating. *This*
+   commit is the revocation.
+
+Exposure is therefore bounded by how fast the two commits are made, not by an instant kill — the
+accepted trade for zero-downtime rotation through one control (ADR 020, Consequences). There is no
+custodian-side override in v1: sphyrix cannot revoke an org's token without that org committing the
+bumps.
+
+The guardrail in step 3 exists because bumping twice faster than consumers can pick the new token up
+retires a version somebody is still using. It belongs in the tooling, not in an operator's head:
+
+```go
+guard := sphyrixauth.BumpGuard{} // DefaultMinBumpInterval, real clock
+err := guard.CheckBump(sphyrixauth.RotationState{
+    Applied:           applied,       // orgs.token_version
+    AppliedAt:         appliedAt,     // tokens.created_at for that version
+    AppliedLastUsedAt: lastUsedAt,    // evidence a consumer has cut over
+}, declared)                          // the org's newly declared token_version
+```
+
+A refusal means **hold the whole bump** — mint nothing and retire nothing — and report the reason.
+Applying the mint while deferring the retirement would put three versions in flight and break the
+at-most-two invariant.
+
+> **Anchor — do not rename the heading.** `docs/runbooks/email-onboarding.md` in
+> `sphyrix/infrastructure` (Story 12.3) links to the procedure above as
+> `https://github.com/sphyrix/contracts/blob/main/README.md#revoking-a-token-two-commits`. GitHub
+> derives that anchor from the heading text "Revoking a token: two commits", so editing the heading
+> silently breaks the runbook's link. `TestTheReadmeDocumentsTheTwoCommitRevocation` pins it.
 
 ## Editing the contract
 

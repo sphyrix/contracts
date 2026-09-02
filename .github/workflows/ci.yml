@@ -14,7 +14,8 @@
 #                       exposed on the descriptor set) and go/auth's own suite
 #                       (ADR 027: hash-only lookup, UNAUTHENTICATED and
 #                       PERMISSION_DENIED mapping, crypto/rand minting,
-#                       TokenFromFile change detection)
+#                       TokenFromFile change detection; ADR 020: the
+#                       accepted-set verifier and the bump guardrail)
 #
 # Every step runs a devtools target inside the devtools container, identical
 # to `just <target>` locally. No credentials: this repo is public, its own

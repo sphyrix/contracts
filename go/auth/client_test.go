@@ -547,7 +547,7 @@ func TestTheTwoHalvesAgree(t *testing.T) {
 		t.Fatalf("Mint: %v", err)
 	}
 	h.store.mu.Lock()
-	h.store.orgs = map[string]Identity{Hash(second): {Org: "becoming-the-hunter", TokenVersion: 1}}
+	h.store.orgs = map[string]Identity{Hash(second): {Org: "becoming-the-hunter", TokenVersion: 1, AppliedTokenVersion: 1}}
 	h.store.mu.Unlock()
 
 	// Before the file is replaced the client is presenting a revoked token —

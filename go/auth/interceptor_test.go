@@ -36,7 +36,18 @@ func newRecordingStore() *recordingStore {
 func (s *recordingStore) hold(token, org string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.orgs[Hash(token)] = Identity{Org: org, TokenVersion: 1}
+	s.orgs[Hash(token)] = Identity{Org: org, TokenVersion: 1, AppliedTokenVersion: 1}
+}
+
+// holdAt is [recordingStore.hold] for an org that has rotated: the token was
+// minted at tokenVersion and the org has since applied applied. It deliberately
+// does NOT enforce ADR 020's accepted set — the point of the tests that use it
+// is that a store CAN answer with a retired row and the interceptor still
+// refuses it.
+func (s *recordingStore) holdAt(token, org string, tokenVersion, applied int32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.orgs[Hash(token)] = Identity{Org: org, TokenVersion: tokenVersion, AppliedTokenVersion: applied}
 }
 
 func (s *recordingStore) LookupTokenHash(_ context.Context, sha256Hex string) (Identity, error) {
@@ -379,7 +390,7 @@ func TestACrossOrgRequestIsPermissionDenied(t *testing.T) {
 }
 
 func TestAuthorizeOrg(t *testing.T) {
-	authenticated := NewContext(context.Background(), Identity{Org: "org-a", TokenVersion: 1})
+	authenticated := NewContext(context.Background(), Identity{Org: "org-a", TokenVersion: 1, AppliedTokenVersion: 1})
 
 	if err := AuthorizeOrg(authenticated, "org-a"); err != nil {
 		t.Errorf("the owner was refused its own resource: %v", err)

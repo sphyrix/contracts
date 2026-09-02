@@ -73,10 +73,45 @@
 // §13), so a consumer that caches it for the process lifetime breaks after
 // every cycle and stays broken until it is restarted.
 //
-// # Rotation
+// # Rotation and revocation
 //
-// v1 has none, by decision (design 001 D-19). [Identity.TokenVersion] carries
-// ADR 027 Decision 8's `token_version` — constant 1 in v1 — so ADR 020 can add
-// rotation and revocation additively rather than by changing this package's
-// exported surface.
+// ADR 020: rotation AND revocation both ride on one control, and that control
+// is `token_version`. It is PLATFORM-WIDE — the single control for every
+// platform M2M token of this class (ADR 027) — so a second sphyrix service
+// copies this convention rather than inventing a `revoked` flag, an expiry, or
+// any other second source of truth about whether a token is live.
+//
+// The version is ORG-AUTHORED: `[email].token_version` in the org's own tenant
+// platform repo, an optional integer of at least 1, defaulting to 1. Rotation
+// is self-service — an org rotates on its own schedule, with no custodian PR —
+// and 1 is a baseline, not a constant: an org that has rotated is at 2 or more.
+//
+// Three properties, in the order they happen:
+//
+//   - Bump, then MINT BESIDE. Raising the version mints the new token
+//     alongside the current one and both authenticate, so there is never a
+//     window in which a consumer holds no valid token.
+//   - The consumer CUTS OVER on its own schedule, by whichever delivery path
+//     it has: the VSO-refreshed mount on-platform ([TokenFromFile]), a rerun
+//     of the devtools delivery command off-platform (ADR 019).
+//   - The FOLLOWING bump REVOKES. Bumping to N mints N beside N-1; bumping to
+//     N+1 mints N+1 and retires N-1. At most [LiveVersions] are ever live.
+//
+// So ONE BUMP MINTS AND DOES NOT REVOKE. Revoking a token takes TWO COMMITS —
+// the first mints its replacement, the second one kills it — and the numbered
+// procedure is in this module's README under "Revoking a token: two commits".
+// It is written down as a procedure because somebody reaching for it in an
+// incident will assume the single obvious edit revokes, and it mints.
+//
+// Verification is therefore against an ACCEPTED SET of `token_version`s rather
+// than against a single value. [AcceptedVersions] and [VersionAccepted] are
+// that set, [Interceptor] enforces it on every request, and [RetiredBy] is the
+// other half — what a bump takes away. A [TokenStore] must report both
+// [Identity.TokenVersion] and [Identity.AppliedTokenVersion], because without
+// the applied version there is no set to check against.
+//
+// [BumpGuard] is ADR 020's guardrail. Two bumps closer together than consumers
+// can pick the new token up would retire a version somebody is still holding,
+// so the minimum interval and the evidence-of-use check belong in the tooling
+// rather than in an operator's head.
 package auth

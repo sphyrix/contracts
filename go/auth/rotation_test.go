@@ -1,0 +1,663 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"math"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+
+	"github.com/sphyrix/contracts/gen/go/hello/v1/hellov1connect"
+)
+
+// ACCEPTANCE: "The accepted-set verifier admits N and N-1 and rejects N-2; a
+// test fails if the set collapses to a single value."
+//
+// The len check is the second half of that sentence and is not decoration: an
+// implementation that returned {applied} would satisfy "admits N" and "rejects
+// N-2" and would still have deleted ADR 020's zero-downtime property, so the
+// test asserts the size of the set as well as its contents.
+func TestTheAcceptedSetHoldsTwoVersionsAndRejectsTheOneBeforeThem(t *testing.T) {
+	for applied := int32(2); applied <= 10; applied++ {
+		want := []int32{applied - 1, applied}
+		if got := AcceptedVersions(applied); !reflect.DeepEqual(got, want) {
+			t.Errorf("AcceptedVersions(%d) = %v, want %v", applied, got, want)
+		}
+		if got := len(AcceptedVersions(applied)); got != LiveVersions {
+			t.Errorf("AcceptedVersions(%d) holds %d version(s), want exactly %d — the set has collapsed and a rotation would strand every consumer that has not cut over",
+				applied, got, LiveVersions)
+		}
+		if !VersionAccepted(applied, applied) {
+			t.Errorf("token_version %d is not accepted at applied version %d — the current version must authenticate", applied, applied)
+		}
+		if !VersionAccepted(applied-1, applied) {
+			t.Errorf("token_version %d is not accepted at applied version %d — the previous version must still authenticate (ADR 020: mint beside)", applied-1, applied)
+		}
+		if VersionAccepted(applied-2, applied) {
+			t.Errorf("token_version %d is still accepted at applied version %d — the following bump must revoke it", applied-2, applied)
+		}
+		if VersionAccepted(applied+1, applied) {
+			t.Errorf("token_version %d is accepted at applied version %d — a version this service has not applied is one it never minted", applied+1, applied)
+		}
+	}
+}
+
+// An org that has never rotated has exactly one version, and it is version 1.
+// The floor is not a special case bolted on: it is what makes the FIRST bump a
+// pure mint-beside, which is what [BumpGuard] lets through unconditionally.
+func TestTheAcceptedSetIsFlooredAtTheFirstVersion(t *testing.T) {
+	want := []int32{FirstTokenVersion}
+	if got := AcceptedVersions(FirstTokenVersion); !reflect.DeepEqual(got, want) {
+		t.Errorf("AcceptedVersions(%d) = %v, want %v", FirstTokenVersion, got, want)
+	}
+	if VersionAccepted(FirstTokenVersion-1, FirstTokenVersion) {
+		t.Errorf("token_version %d is accepted — there is no version below %d", FirstTokenVersion-1, FirstTokenVersion)
+	}
+}
+
+// A version below the first one is not a version. The set is empty and nothing
+// authenticates against it: an unusable applied version must fail closed, never
+// open.
+func TestAnAppliedVersionBelowTheFirstAcceptsNothing(t *testing.T) {
+	for _, applied := range []int32{0, -1, math.MinInt32} {
+		if got := AcceptedVersions(applied); len(got) != 0 {
+			t.Errorf("AcceptedVersions(%d) = %v, want the empty set", applied, got)
+		}
+		for _, tokenVersion := range []int32{-1, 0, 1, 2} {
+			if VersionAccepted(tokenVersion, applied) {
+				t.Errorf("token_version %d is accepted at applied version %d — an unusable applied version must accept nothing", tokenVersion, applied)
+			}
+		}
+	}
+}
+
+// RetiredBy is the revocation half, and the property that matters is the one
+// operators get wrong: the first bump retires NOTHING.
+func TestOneBumpRetiresNothingAndTheFollowingBumpRetires(t *testing.T) {
+	if got := RetiredBy(1, 2); len(got) != 0 {
+		t.Errorf("bumping 1 -> 2 retired %v, want nothing — one bump mints beside and does not revoke", got)
+	}
+	for applied := int32(2); applied <= 10; applied++ {
+		want := []int32{applied - 1}
+		if got := RetiredBy(applied, applied+1); !reflect.DeepEqual(got, want) {
+			t.Errorf("bumping %d -> %d retired %v, want %v", applied, applied+1, got, want)
+		}
+	}
+	// Applying two bumps at once would retire two versions at a stroke — which
+	// is why CheckBump refuses a skip rather than collapsing it.
+	if got, want := RetiredBy(3, 5), []int32{2, 3}; !reflect.DeepEqual(got, want) {
+		t.Errorf("bumping 3 -> 5 retired %v, want %v", got, want)
+	}
+}
+
+// ACCEPTANCE: "A bump-to-N-then-N+1 sequence leaves exactly two live versions
+// at every point — asserted across the whole sequence, not only at the end."
+//
+// The assertion runs through the REAL interceptor over a real Connect server:
+// what is counted is how many tokens a caller can actually authenticate with,
+// not what a helper says the set is. The expectation is written out
+// independently of [AcceptedVersions] — {applied-1, applied}, spelled here —
+// so the test cannot agree with a broken implementation by construction.
+func TestARotationSequenceLeavesExactlyTwoLiveVersionsAtEveryPoint(t *testing.T) {
+	const highest = 6
+
+	h := newHarness(t, &helloHandler{})
+
+	// One token per version, all present in the store at once: a store keeps
+	// the row for every version it has ever minted until retirement deletes
+	// it, and this test is about which of them still AUTHENTICATE.
+	tokens := make(map[int32]string, highest)
+	for version := int32(1); version <= highest; version++ {
+		token, err := Mint("email")
+		if err != nil {
+			t.Fatalf("Mint: %v", err)
+		}
+		tokens[version] = token
+	}
+
+	for applied := int32(1); applied <= highest; applied++ {
+		for version, token := range tokens {
+			h.store.holdAt(token, "becoming-the-hunter", version, applied)
+		}
+
+		// Written out rather than derived: at applied version N the live set
+		// is N and N-1, and at version 1 it is 1 alone.
+		live := map[int32]bool{applied: true}
+		if applied > FirstTokenVersion {
+			live[applied-1] = true
+		}
+
+		authenticated := 0
+		for version := int32(1); version <= highest; version++ {
+			org, err := h.call(t, bearer(tokens[version]))
+			switch {
+			case live[version] && err != nil:
+				t.Fatalf("applied=%d: token_version %d was refused (%v) — it must still authenticate", applied, version, connect.CodeOf(err))
+			case live[version]:
+				authenticated++
+				if org != "becoming-the-hunter" {
+					t.Errorf("applied=%d: token_version %d authenticated as %q", applied, version, org)
+				}
+			case err == nil:
+				t.Fatalf("applied=%d: token_version %d authenticated — it is not in the live set and must be refused", applied, version)
+			case connect.CodeOf(err) != connect.CodeUnauthenticated:
+				t.Errorf("applied=%d: token_version %d gave %v, want %v", applied, version, connect.CodeOf(err), connect.CodeUnauthenticated)
+			}
+		}
+
+		want := LiveVersions
+		if applied == FirstTokenVersion {
+			want = 1
+		}
+		if authenticated != want {
+			t.Errorf("applied=%d: %d version(s) authenticated, want exactly %d", applied, authenticated, want)
+		}
+	}
+}
+
+// The other half of the sequence: applying each bump through [BumpGuard] and
+// [RetiredBy] the way a verifying service will, and checking the invariant
+// after every single step rather than at the end. This is the model that
+// Story 11.3 (#434) implements against.
+func TestApplyingASequenceOfBumpsKeepsAtMostTwoVersionsLive(t *testing.T) {
+	guard := BumpGuard{MinInterval: time.Minute, Now: func() time.Time { return time.Unix(0, 0) }}
+
+	applied := FirstTokenVersion
+	minted := map[int32]bool{FirstTokenVersion: true}
+
+	for declared := FirstTokenVersion + 1; declared <= 8; declared++ {
+		state := RotationState{
+			Applied: applied,
+			// Long enough ago, and used since: the guardrail's own refusals
+			// have their own tests; this one is about the applied sequence.
+			AppliedAt:         time.Unix(0, 0).Add(-time.Hour),
+			AppliedLastUsedAt: time.Unix(0, 0).Add(-time.Minute),
+		}
+		if err := guard.CheckBump(state, declared); err != nil {
+			t.Fatalf("bumping %d -> %d was refused: %v", applied, declared, err)
+		}
+
+		// Apply: mint the new version, then retire what the bump retires.
+		minted[declared] = true
+		for _, version := range RetiredBy(applied, declared) {
+			if !minted[version] {
+				t.Fatalf("bumping %d -> %d retired version %d, which was never minted", applied, declared, version)
+			}
+			delete(minted, version)
+		}
+		applied = declared
+
+		if len(minted) > LiveVersions {
+			t.Fatalf("after applying %d, %d versions are live (%v) — at most %d may ever be", applied, len(minted), sortedVersions(minted), LiveVersions)
+		}
+		if len(minted) != LiveVersions {
+			t.Fatalf("after applying %d, %d version(s) are live (%v) — the set has collapsed", applied, len(minted), sortedVersions(minted))
+		}
+		if !minted[applied] || !minted[applied-1] {
+			t.Fatalf("after applying %d the live set is %v, want {%d, %d}", applied, sortedVersions(minted), applied-1, applied)
+		}
+		if minted[applied-2] {
+			t.Fatalf("after applying %d version %d is still live — the following bump must revoke it", applied, applied-2)
+		}
+	}
+}
+
+func sortedVersions(set map[int32]bool) []int32 {
+	var versions []int32
+	for version, live := range set {
+		if live {
+			versions = append(versions, version)
+		}
+	}
+	for i := 1; i < len(versions); i++ {
+		for j := i; j > 0 && versions[j] < versions[j-1]; j-- {
+			versions[j], versions[j-1] = versions[j-1], versions[j]
+		}
+	}
+	return versions
+}
+
+// ACCEPTANCE (refusal half): "The guardrail refuses a second bump inside the
+// minimum interval (or without evidence the new version is in use) and names
+// the reason."
+func TestTheGuardRefusesASecondBumpInsideTheMinimumInterval(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	guard := BumpGuard{MinInterval: 15 * time.Minute, Now: func() time.Time { return now }}
+
+	// Version 2 was applied a minute ago and is in use. Bumping to 3 would
+	// retire version 1, which consumers may still be holding.
+	state := RotationState{
+		Applied:           2,
+		AppliedAt:         now.Add(-1 * time.Minute),
+		AppliedLastUsedAt: now.Add(-30 * time.Second),
+	}
+
+	err := guard.CheckBump(state, 3)
+	if err == nil {
+		t.Fatal("a second bump one minute after the first was allowed — it would retire a version consumers may still hold")
+	}
+	if !errors.Is(err, ErrBumpTooSoon) {
+		t.Errorf("the refusal is %v, want it to wrap ErrBumpTooSoon", err)
+	}
+	// "names the reason": the message has to carry the numbers an operator
+	// needs, not just a sentinel.
+	for _, want := range []string{"1m0s", "15m0s", "token_version 1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal %q does not mention %q", err, want)
+		}
+	}
+}
+
+// An unknown application time is treated as "too soon", never as "long ago".
+func TestTheGuardRefusesABumpWhenTheApplicationTimeIsUnknown(t *testing.T) {
+	guard := BumpGuard{MinInterval: time.Minute, Now: func() time.Time { return time.Unix(1_000_000, 0) }}
+	err := guard.CheckBump(RotationState{Applied: 2, AppliedLastUsedAt: time.Unix(999_999, 0)}, 3)
+	if !errors.Is(err, ErrBumpTooSoon) {
+		t.Fatalf("a bump with no recorded application time gave %v, want ErrBumpTooSoon", err)
+	}
+}
+
+// ACCEPTANCE (the "or without evidence the new version is in use" half).
+func TestTheGuardRefusesABumpWithNoEvidenceTheAppliedVersionIsInUse(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	guard := BumpGuard{MinInterval: 15 * time.Minute, Now: func() time.Time { return now }}
+	appliedAt := now.Add(-24 * time.Hour)
+
+	for name, state := range map[string]RotationState{
+		"never used": {
+			Applied:   2,
+			AppliedAt: appliedAt,
+		},
+		"last used before the version was applied": {
+			Applied:           2,
+			AppliedAt:         appliedAt,
+			AppliedLastUsedAt: appliedAt.Add(-time.Second),
+		},
+	} {
+		err := guard.CheckBump(state, 3)
+		if err == nil {
+			t.Fatalf("%s: the bump was allowed with no evidence anybody has picked the new version up", name)
+		}
+		if !errors.Is(err, ErrVersionNotInUse) {
+			t.Errorf("%s: the refusal is %v, want it to wrap ErrVersionNotInUse", name, err)
+		}
+		if !strings.Contains(err.Error(), "token_version 1") {
+			t.Errorf("%s: the refusal %q does not name the version it would retire", name, err)
+		}
+	}
+}
+
+// ACCEPTANCE (legal half): "a test drives the legal path."
+func TestTheGuardAllowsABumpOnceTheIntervalHasPassedAndTheVersionIsInUse(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	guard := BumpGuard{MinInterval: 15 * time.Minute, Now: func() time.Time { return now }}
+
+	state := RotationState{
+		Applied:           2,
+		AppliedAt:         now.Add(-16 * time.Minute),
+		AppliedLastUsedAt: now.Add(-5 * time.Minute),
+	}
+	if err := guard.CheckBump(state, 3); err != nil {
+		t.Fatalf("a bump 16 minutes after the last one, with the new version in use, was refused: %v", err)
+	}
+
+	// Exactly at the boundary is allowed; a second under it is not. An
+	// inverted comparison fails here.
+	state.AppliedAt = now.Add(-15 * time.Minute)
+	if err := guard.CheckBump(state, 3); err != nil {
+		t.Errorf("a bump exactly at the minimum interval was refused: %v", err)
+	}
+	state.AppliedAt = now.Add(-15*time.Minute + time.Second)
+	if err := guard.CheckBump(state, 3); !errors.Is(err, ErrBumpTooSoon) {
+		t.Errorf("a bump one second inside the minimum interval gave %v, want ErrBumpTooSoon", err)
+	}
+}
+
+// The first bump mints beside and retires nothing, so it is legal immediately
+// — however recent the org's first token is and whether or not anything has
+// used it. This is what makes "one bump mints, it does not revoke" true.
+func TestTheGuardAllowsTheFirstBumpImmediately(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	guard := BumpGuard{MinInterval: 24 * time.Hour, Now: func() time.Time { return now }}
+
+	state := RotationState{Applied: FirstTokenVersion, AppliedAt: now}
+	if err := guard.CheckBump(state, FirstTokenVersion+1); err != nil {
+		t.Fatalf("the first bump was refused: %v — it retires nothing, so there is nobody to strand", err)
+	}
+	if got := RetiredBy(FirstTokenVersion, FirstTokenVersion+1); len(got) != 0 {
+		t.Fatalf("the first bump retires %v — the test above passed for the wrong reason", got)
+	}
+}
+
+// A bump is one version. Everything else is refused, and a SKIP is refused
+// precisely because it is two bumps with no interval between them.
+func TestTheGuardRefusesAnythingThatIsNotASingleBump(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	guard := BumpGuard{Now: func() time.Time { return now }}
+	safe := RotationState{
+		Applied:           3,
+		AppliedAt:         now.Add(-24 * time.Hour),
+		AppliedLastUsedAt: now.Add(-time.Hour),
+	}
+
+	for name, declared := range map[string]int32{
+		"the same version": 3,
+		"a lower version":  2,
+		"a much lower one": 1,
+		"skipping one":     5,
+		"skipping many":    99,
+	} {
+		err := guard.CheckBump(safe, declared)
+		if err == nil {
+			t.Errorf("%s (declared %d against applied %d) was allowed", name, declared, safe.Applied)
+			continue
+		}
+		if !errors.Is(err, ErrNotABump) {
+			t.Errorf("%s: the refusal is %v, want it to wrap ErrNotABump", name, err)
+		}
+	}
+
+	// The control: the one legal value is allowed, so the loop above is not
+	// passing because everything is refused.
+	if err := guard.CheckBump(safe, 4); err != nil {
+		t.Fatalf("the single legal bump (3 -> 4) was refused: %v", err)
+	}
+
+	// Each refusal names ITS OWN reason, not just the shared sentinel. All
+	// three wrap ErrNotABump, so without these the branches that distinguish
+	// them could be deleted and every test above would still pass.
+	if err := guard.CheckBump(safe, 5); !strings.Contains(err.Error(), "token_versions 2 and 3") {
+		t.Errorf("the skip refusal %q does not name the two versions it would retire at once", err)
+	}
+	if err := guard.CheckBump(safe, 2); !strings.Contains(err.Error(), "lowering") {
+		t.Errorf("the refusal of a LOWER version is %q — it must say that lowering would retire live tokens rather than rotate them", err)
+	}
+	if err := guard.CheckBump(safe, 3); !strings.Contains(err.Error(), "already applied") {
+		t.Errorf("the refusal of the SAME version is %q — it must say there is nothing to bump", err)
+	}
+}
+
+// An applied version below the first one is the caller's bug, and it is named
+// as one rather than being folded into "not a bump".
+func TestTheGuardRefusesAnUnusableRotationState(t *testing.T) {
+	guard := BumpGuard{}
+	for _, applied := range []int32{0, -1, math.MinInt32} {
+		err := guard.CheckBump(RotationState{Applied: applied}, applied+1)
+		if !errors.Is(err, ErrInvalidRotationState) {
+			t.Errorf("an applied version of %d gave %v, want ErrInvalidRotationState", applied, err)
+		}
+	}
+}
+
+// The largest int32 has nowhere to bump to, and asking must refuse rather than
+// wrap around into a negative version.
+func TestTheGuardDoesNotWrapAroundAtTheLargestVersion(t *testing.T) {
+	guard := BumpGuard{}
+	state := RotationState{Applied: math.MaxInt32, AppliedAt: time.Unix(0, 0), AppliedLastUsedAt: time.Unix(1, 0)}
+	for _, declared := range []int32{math.MaxInt32, math.MinInt32, 1} {
+		err := guard.CheckBump(state, declared)
+		if !errors.Is(err, ErrNotABump) {
+			t.Errorf("declaring %d against applied %d gave %v, want ErrNotABump", declared, state.Applied, err)
+			continue
+		}
+		// The reason must be the overflow, not "already applied" or "below the
+		// applied version": those are true by accident of the branch order,
+		// and an operator reading them would go looking for the wrong problem.
+		// Asserting the message is what keeps the explicit MaxInt32 check from
+		// being deleted as redundant — it is redundant only until somebody
+		// reorders the switch.
+		if !strings.Contains(err.Error(), "largest int32") {
+			t.Errorf("declaring %d against applied MaxInt32 gave %q — it must name the overflow as the reason", declared, err)
+		}
+	}
+}
+
+// The zero value has to be usable, because a caller that has to configure the
+// guardrail before it protects anything is a caller that will not configure it.
+func TestTheZeroGuardEnforcesTheDefaultIntervalAgainstTheRealClock(t *testing.T) {
+	var guard BumpGuard
+
+	tooSoon := RotationState{
+		Applied:           2,
+		AppliedAt:         time.Now().Add(-(DefaultMinBumpInterval - time.Minute)),
+		AppliedLastUsedAt: time.Now().Add(-time.Minute),
+	}
+	if err := guard.CheckBump(tooSoon, 3); !errors.Is(err, ErrBumpTooSoon) {
+		t.Errorf("the zero guard gave %v a minute inside the default interval, want ErrBumpTooSoon", err)
+	}
+
+	safe := RotationState{
+		Applied:           2,
+		AppliedAt:         time.Now().Add(-(DefaultMinBumpInterval + time.Minute)),
+		AppliedLastUsedAt: time.Now().Add(-time.Minute),
+	}
+	if err := guard.CheckBump(safe, 3); err != nil {
+		t.Errorf("the zero guard refused a bump a minute past the default interval: %v", err)
+	}
+
+	// A negative MinInterval is not "no interval": there is no way to spell
+	// that, because it is the failure the guard exists to prevent.
+	off := BumpGuard{MinInterval: -time.Hour}
+	if err := off.CheckBump(tooSoon, 3); !errors.Is(err, ErrBumpTooSoon) {
+		t.Errorf("a negative MinInterval disabled the guardrail: %v", err)
+	}
+}
+
+// No refusal may carry a token or a hash: these errors reach logs and, in a
+// service that reports rotation status, possibly a UI.
+func TestNoGuardRefusalCarriesASecret(t *testing.T) {
+	token, err := Mint("email")
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	guard := BumpGuard{}
+	for _, refusal := range []error{
+		guard.CheckBump(RotationState{Applied: 0}, 1),
+		guard.CheckBump(RotationState{Applied: 2}, 2),
+		guard.CheckBump(RotationState{Applied: 2}, 9),
+		guard.CheckBump(RotationState{Applied: 2, AppliedAt: time.Now()}, 3),
+		guard.CheckBump(RotationState{Applied: 2, AppliedAt: time.Now().Add(-24 * time.Hour)}, 3),
+	} {
+		if refusal == nil {
+			t.Fatal("one of the refusal cases returned nil — the test checked nothing")
+		}
+		message := refusal.Error()
+		for _, secret := range []string{token, Hash(token), Prefix} {
+			if strings.Contains(message, secret) {
+				t.Errorf("a refusal message leaks a secret: %q", message)
+			}
+		}
+	}
+}
+
+// ACCEPTANCE (verifier half, end to end): a retired row that a store still
+// answers with must not authenticate. Retirement deletes rows, so in the
+// steady state the lookup simply misses — this proves the accepted set is
+// enforced even when it has not.
+func TestARetiredVersionIsRefusedEvenWhenTheStoreStillHoldsIt(t *testing.T) {
+	h := newHarness(t, &helloHandler{})
+
+	previous, current, retired := mustMint(t), mustMint(t), mustMint(t)
+	h.store.holdAt(current, "becoming-the-hunter", 3, 3)
+	h.store.holdAt(previous, "becoming-the-hunter", 2, 3)
+	h.store.holdAt(retired, "becoming-the-hunter", 1, 3)
+
+	for name, token := range map[string]string{"the current version": current, "the previous version": previous} {
+		if _, err := h.call(t, bearer(token)); err != nil {
+			t.Errorf("%s was refused (%v) — both live versions must authenticate", name, connect.CodeOf(err))
+		}
+	}
+
+	_, err := h.call(t, bearer(retired))
+	if err == nil {
+		t.Fatal("a token two versions behind authenticated — the following bump must revoke it")
+	}
+	if got := connect.CodeOf(err); got != connect.CodeUnauthenticated {
+		t.Errorf("a retired token gave %v, want %v — a revoked token is indistinguishable from an unknown one", got, connect.CodeUnauthenticated)
+	}
+	// And the refusal says nothing about which failure it was.
+	if message := err.Error(); strings.Contains(message, "version") || strings.Contains(message, "3") {
+		t.Errorf("the refusal %q tells a prober why it failed", message)
+	}
+}
+
+// A store that does not report the applied version is a store the accepted set
+// cannot be checked against. That is this service's bug, not the caller's, so
+// it is INTERNAL — and emphatically not "accept anything", which would turn
+// revocation off without a word.
+func TestAStoreThatReportsNoVersionsFailsClosedAsInternal(t *testing.T) {
+	for name, identity := range map[string]Identity{
+		"no versions at all":     {Org: "becoming-the-hunter"},
+		"no applied version":     {Org: "becoming-the-hunter", TokenVersion: 1},
+		"no token version":       {Org: "becoming-the-hunter", AppliedTokenVersion: 1},
+		"a negative token row":   {Org: "becoming-the-hunter", TokenVersion: -1, AppliedTokenVersion: 1},
+		"a negative applied row": {Org: "becoming-the-hunter", TokenVersion: 1, AppliedTokenVersion: -1},
+	} {
+		h := newHarness(t, &helloHandler{})
+		token := mustMint(t)
+		h.store.holdAt(token, identity.Org, identity.TokenVersion, identity.AppliedTokenVersion)
+
+		_, err := h.call(t, bearer(token))
+		if err == nil {
+			t.Fatalf("%s: the request was authenticated against a store that cannot be version-checked", name)
+		}
+		if got := connect.CodeOf(err); got != connect.CodeInternal {
+			t.Errorf("%s: got %v, want %v — the store is at fault, not the caller", name, got, connect.CodeInternal)
+		}
+	}
+}
+
+// The control for the test above: the same harness with both versions set
+// authenticates, so "INTERNAL" is not simply what this harness always answers.
+func TestAStoreThatReportsBothVersionsAuthenticates(t *testing.T) {
+	h := newHarness(t, &helloHandler{})
+	token := mustMint(t)
+	h.store.holdAt(token, "becoming-the-hunter", 1, 1)
+	if org, err := h.call(t, bearer(token)); err != nil || org != "becoming-the-hunter" {
+		t.Fatalf("a fully-reported identity gave (%q, %v), want the org and no error", org, err)
+	}
+}
+
+// The rotation window as a handler sees it: it learns which version
+// authenticated AND which one the org is on, so a service can tell a consumer
+// that it is still on the previous token and should cut over before the next
+// bump retires it.
+func TestTheInterceptorPlantsBothVersionsInTheContext(t *testing.T) {
+	store := newRecordingStore()
+	token := mustMint(t)
+	store.holdAt(token, "becoming-the-hunter", 4, 5)
+
+	interceptor, err := NewInterceptor("email", store)
+	if err != nil {
+		t.Fatalf("NewInterceptor: %v", err)
+	}
+
+	var seen Identity
+	wrapped := interceptor.WrapStreamingHandler(func(ctx context.Context, _ connect.StreamingHandlerConn) error {
+		seen, _ = FromContext(ctx)
+		return nil
+	})
+	conn := newFakeHandlerConn(hellov1connect.HelloServiceSayHelloProcedure)
+	conn.header.Set("Authorization", "Bearer "+token)
+	if err := wrapped(context.Background(), conn); err != nil {
+		t.Fatalf("a token at the previous version was refused: %v", err)
+	}
+	if seen.TokenVersion != 4 || seen.AppliedTokenVersion != 5 {
+		t.Errorf("the handler saw %+v, want TokenVersion 4 and AppliedTokenVersion 5", seen)
+	}
+}
+
+func mustMint(t *testing.T) string {
+	t.Helper()
+	token, err := Mint("email")
+	if err != nil {
+		t.Fatalf("Mint: %v", err)
+	}
+	return token
+}
+
+// formatVersions renders into error messages an operator reads under pressure,
+// so its output is pinned.
+func TestFormatVersionsReadsAsProse(t *testing.T) {
+	for _, tc := range []struct {
+		in   []int32
+		want string
+	}{
+		{nil, "nothing"},
+		{[]int32{1}, "token_version 1"},
+		{[]int32{1, 2}, "token_versions 1 and 2"},
+		{[]int32{1, 2, 3}, "token_versions 1, 2 and 3"},
+	} {
+		if got := formatVersions(tc.in); got != tc.want {
+			t.Errorf("formatVersions(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The largest int32 must not spin. `token_version` is ORG-AUTHORED and the
+// reconciler validates it only as "an integer >= 1" — explicitly unbounded
+// above — so math.MaxInt32 is a value a tenant can put in its own repo, and it
+// reaches [AcceptedVersions] on every authenticated request through
+// [Identity.AppliedTokenVersion]. The obvious `for v := low; v <= high; v++`
+// never terminates there (the increment wraps to the smallest int32, which is
+// still <= high) and appends until the process is OOM-killed: a denial of
+// service on the shared verifying service, triggerable from a tenant commit.
+//
+// The short timeout is the assertion. A regression does not fail this test by
+// returning the wrong slice, it fails by never returning at all.
+func TestTheAcceptedSetTerminatesAtTheLargestVersion(t *testing.T) {
+	done := make(chan []int32, 1)
+	go func() { done <- AcceptedVersions(math.MaxInt32) }()
+
+	select {
+	case got := <-done:
+		want := []int32{math.MaxInt32 - 1, math.MaxInt32}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("AcceptedVersions(MaxInt32) = %v, want %v", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AcceptedVersions(MaxInt32) did not return within 5s — the version loop is unbounded and will exhaust memory")
+	}
+
+	if !VersionAccepted(math.MaxInt32, math.MaxInt32) || !VersionAccepted(math.MaxInt32-1, math.MaxInt32) {
+		t.Error("the two live versions are not accepted at the largest applied version")
+	}
+	if VersionAccepted(math.MaxInt32-2, math.MaxInt32) {
+		t.Error("a retired version is accepted at the largest applied version")
+	}
+}
+
+// The same boundary reached the way a request reaches it: through the store,
+// through the interceptor, on the hot path. This is the reachability half of
+// the test above — it fails by hanging if the bound is lost.
+func TestARequestAtTheLargestVersionDoesNotSpin(t *testing.T) {
+	h := newHarness(t, &helloHandler{})
+	token := mustMint(t)
+	h.store.holdAt(token, "becoming-the-hunter", math.MaxInt32, math.MaxInt32)
+
+	type result struct {
+		org string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		org, err := h.call(t, bearer(token))
+		done <- result{org, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("a token at the largest version was refused: %v", got.err)
+		}
+		if got.org != "becoming-the-hunter" {
+			t.Errorf("authenticated as %q, want becoming-the-hunter", got.org)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a request at the largest applied token_version never completed — the accepted-set loop is unbounded")
+	}
+}
