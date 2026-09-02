@@ -255,6 +255,12 @@ mint, so the budget is three per resync rather than three ever — report that l
 `email_org_ready{org}`). It means something is rewriting an org's token path repeatedly, and a mint
 that gave up quietly would leave the org with no new token and nobody looking.
 
+**Platform-wide rule: the version never appears in the path.** `token_version` is a property of the
+row, not of the address — the Vault path is the same for every version. That is what lets ADR 027
+Decision 5 mount the KV *secret directory* (never `subPath`) and lets ADR 020 promise that *"Vault
+continues to present the current token … no consumer ever has to hold two"*. A service that put the
+version in the path would move the mount and make every consumer discover which version to read.
+
 The version source stays behind `auth.TokenPathVersion`:
 
 ```go
