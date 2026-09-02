@@ -58,7 +58,7 @@ const (
 	//   - OFF-PLATFORM: a human rerunning the ADR 019 devtools command for
 	//     every off-platform consumer. Not boundable by any constant here.
 	//
-	// Fifteen minutes is roughly five times the on-platform bound and short
+	// Fifteen minutes is roughly five times [onPlatformPickupBound] and short
 	// enough that an incident revocation is not obstructed for long. It
 	// does NOT cover the off-platform path — nothing can — which is why
 	// [BumpGuard] also requires evidence that the version being superseded has
@@ -66,6 +66,19 @@ const (
 	// off-platform consumer" is a step of the procedure in this repo's README
 	// rather than something the interval stands in for.
 	DefaultMinBumpInterval = 15 * time.Minute
+
+	// onPlatformPickupBound is how long an ON-PLATFORM consumer can take to
+	// pick a newly minted token up, worst case: VSO's `refreshAfter: 1m` (ADR
+	// 027 Decision 5), plus kubelet's projection of the updated Secret into
+	// the mounted volume, plus the consumer's own [DefaultRefreshInterval].
+	//
+	// It is the floor ADR 020's Consequences put under the safe interval
+	// between two bumps, and it exists as a named constant so that
+	// [DefaultMinBumpInterval]'s derivation is something a test can check
+	// rather than a claim in a comment. Off-platform pickup is a human
+	// rerunning the ADR 019 command and is not boundable here — which is why
+	// this is a floor and not the answer.
+	onPlatformPickupBound = 3 * time.Minute
 )
 
 // The reasons [BumpGuard.CheckBump] refuses. Each names one thing, so a caller
@@ -389,8 +402,11 @@ func (g BumpGuard) CheckBump(state RotationState, declared int32) error {
 		return fmt.Errorf("auth: the declared token_version %d is below the applied version %d — lowering it would retire live tokens rather than rotate them: %w",
 			declared, state.Applied, ErrNotABump)
 	case declared != state.Applied+1:
-		return fmt.Errorf("auth: the declared token_version %d skips past the applied version %d; each skipped version is a bump with no interval before it, and applying them together would retire %s while consumers may still be holding them — bump one version at a time: %w",
-			declared, state.Applied, formatVersions(RetiredBy(state.Applied, declared)), ErrNotABump)
+		// The refusal is permanent until the DECLARATION changes: nothing the
+		// service does will make a skip legal, so the message has to name the
+		// way out or an org sits behind a guardrail with no visible exit.
+		return fmt.Errorf("auth: the declared token_version %d skips past the applied version %d; each skipped version is a bump with no interval before it, and applying them together would retire %s while consumers may still be holding them — edit token_version back down to %d and bump one version at a time: %w",
+			declared, state.Applied, formatVersions(RetiredBy(state.Applied, declared)), state.Applied+1, ErrNotABump)
 	}
 
 	retired := RetiredBy(state.Applied, declared)

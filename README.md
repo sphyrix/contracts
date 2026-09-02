@@ -177,6 +177,12 @@ To retire a token that is live at version `N` (a leak, a compromise, an offboard
    the accepted set becomes `{N+1, N+2}`, and the compromised token stops authenticating. *This*
    commit is the revocation.
 
+**If you skip a version by mistake** — declaring `N+3` while `N+1` is applied — the bump is refused
+permanently, and no custodian can lift it: applying several at once would retire versions consumers
+may still hold. **Edit `token_version` back down** to one above the applied version and merge again.
+Lowering it below the applied version is refused too, so the only safe edit is down to
+`applied + 1`.
+
 Exposure is therefore bounded by how fast the two commits are made, not by an instant kill — the
 accepted trade for zero-downtime rotation through one control (ADR 020, Consequences). There is no
 custodian-side override in v1: sphyrix cannot revoke an org's token without that org committing the

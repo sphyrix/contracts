@@ -988,3 +988,50 @@ func TestCASWriterRequiresItsCollaborators(t *testing.T) {
 		t.Error("a CASWriter with no write function was accepted")
 	}
 }
+
+// The interval constants are PINNED BY INVARIANT here, because every other
+// interval test builds its fixtures relative to DefaultMinBumpInterval — a test
+// shaped like `AppliedAt: now.Add(-(DefaultMinBumpInterval - time.Minute))`
+// moves with the constant, so setting the constant to 0, 1ns or a negative
+// duration leaves the whole suite green while the guardrail is off for every
+// zero-value BumpGuard{}, which is the configuration the README recommends.
+//
+// So: assert what the value has to BE, not what some fixture computed from it
+// happens to do.
+func TestTheDefaultBumpIntervalIsAUsableInterval(t *testing.T) {
+	got := BumpGuard{}.minInterval()
+
+	// Zero or negative is not an interval. minInterval() maps a zero or
+	// negative FIELD to the default, so a non-positive default would make the
+	// guardrail unenforceable with no way for a caller to restore it.
+	if got <= 0 {
+		t.Fatalf("BumpGuard{}.minInterval() = %s — a zero-value guard must enforce a positive interval, or the interval half of the guardrail is off by default", got)
+	}
+
+	// And it must be at least the time an on-platform consumer can take to
+	// pick the new token up, which is the floor ADR 020's Consequences put
+	// under the safe interval between two bumps. 1ns is positive and useless.
+	if got < onPlatformPickupBound {
+		t.Errorf("BumpGuard{}.minInterval() = %s, which is below the on-platform pickup bound of %s — a second bump inside that window retires a version consumers have not replaced yet",
+			got, onPlatformPickupBound)
+	}
+
+	// The bound itself is derived from published numbers; if DefaultRefreshInterval
+	// grows past it, the derivation in DefaultMinBumpInterval's doc is stale.
+	if onPlatformPickupBound <= DefaultRefreshInterval {
+		t.Errorf("onPlatformPickupBound (%s) is not above DefaultRefreshInterval (%s) — the pickup bound must cover the consumer's own re-read",
+			onPlatformPickupBound, DefaultRefreshInterval)
+	}
+}
+
+// DefaultCASAttempts is unpinned in the same way: every CAS test compares
+// against the constant, so widening it to 50 keeps them green while turning a
+// bounded retry into a long one against a tenant-writable path.
+func TestTheDefaultCASAttemptBudgetIsSmallAndPositive(t *testing.T) {
+	if DefaultCASAttempts < 1 {
+		t.Fatalf("DefaultCASAttempts = %d — a budget below 1 means a mint never attempts its write at all", DefaultCASAttempts)
+	}
+	if DefaultCASAttempts > 10 {
+		t.Errorf("DefaultCASAttempts = %d — the conflict being retried is a tenant overwriting its own path, which is rare and not adversarial; a large budget hides a path being rewritten continuously instead of reporting it", DefaultCASAttempts)
+	}
+}

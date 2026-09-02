@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strconv"
@@ -122,6 +123,39 @@ func TestTheReadmeRecordsTheADR027Decision4Amendment(t *testing.T) {
 		if !strings.Contains(lower, phrase) {
 			t.Errorf("the README does not mention %q — the bounded read/write/retry procedure is the ruled one and #434 implements against it", phrase)
 		}
+	}
+}
+
+// The README states both defaults as literal prose ("15 minutes", "(3)"). Prose
+// and constant drift apart silently — nothing in Go links them — and the
+// direction that matters is the dangerous one: a constant lowered to 0 or a
+// budget widened to 50 while the README still advertises the safe number, so an
+// operator plans a revocation around a guardrail that is not there.
+//
+// Rendered from the constants, so changing either forces the README to change
+// with it.
+func TestTheReadmeQuotesTheDefaultsAccurately(t *testing.T) {
+	readme := readReadme(t)
+
+	minutes := fmt.Sprintf("%d minutes", int(DefaultMinBumpInterval.Minutes()))
+	if !strings.Contains(readme, minutes) {
+		t.Errorf("the README does not say %q — DefaultMinBumpInterval is %s and the procedure quotes it as prose, so the two have drifted", minutes, DefaultMinBumpInterval)
+	}
+
+	attempts := fmt.Sprintf("`auth.DefaultCASAttempts` (%d)", DefaultCASAttempts)
+	if !strings.Contains(readme, attempts) {
+		t.Errorf("the README does not say %q — DefaultCASAttempts is %d and the cas section quotes it as prose", attempts, DefaultCASAttempts)
+	}
+}
+
+// A skipped version is refused permanently: nothing the service does makes it
+// legal, only a change to the org's declaration. The procedure has to say how
+// to get out, or an org that fat-fingers 2 -> 4 sits behind a guardrail with no
+// visible exit and no custodian who can lift it.
+func TestTheReadmeDocumentsSkipRecovery(t *testing.T) {
+	section := revocationSection(t, readReadme(t), "#### Revoking a token: two commits")
+	if !anyParagraphContainsAll(paragraphsOf(section), []string{"skip", "down"}) {
+		t.Error("the revocation procedure does not say that a skipped version is recovered by editing token_version back DOWN — a skip is refused until the declaration changes, and no custodian can lift it")
 	}
 }
 
